@@ -1,6 +1,6 @@
 # 🐂 Bull Run — Stock News Aggregator
 
-Bull Run scrapes stock-related news from Yahoo Finance and custom URLs, then uses a local LLM to generate concise, actionable summaries. Everything runs on your machine — no cloud API keys, no data leaving your desktop.
+A local-first stock news aggregator that scrapes financial news and uses a local LLM to produce concise, actionable summaries — no cloud API keys required.
 
 ![Stack](https://img.shields.io/badge/Python-3.11+-blue)
 ![Streamlit](https://img.shields.io/badge/UI-Streamlit-orange)

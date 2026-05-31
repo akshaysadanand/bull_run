@@ -1,0 +1,16 @@
+[project]
+name = "bull-run"
+version = "0.1.0"
+description = "Stock news aggregator with local LLM summarization"
+requires-python = ">=3.11"
+dependencies = [
+    "streamlit>=1.30.0",
+    "playwright>=1.40.0",
+    "openai>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-mock>=3.12.0",
+]

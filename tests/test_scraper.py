@@ -195,3 +195,148 @@ class TestScrapeUrlsEmptyInput:
         from scraper import scrape_urls
         result = scrape_urls(["  ", ""], "AAPL", "http://localhost:8080/v1", "model")
         assert result == []
+
+
+def _make_mock_pw(articles_eval=None, goto_side_effect=None,
+                  content_return=None, title_return=None, evaluate_return=None):
+    """Build a mock Playwright chain for scrape_urls tests."""
+    mock_page = MagicMock()
+    if goto_side_effect is not None:
+        mock_page.goto.side_effect = goto_side_effect
+    else:
+        mock_page.goto.return_value = None
+    mock_page.content.return_value = content_return or "<html><body><h1>Article</h1><p>Content.</p></body></html>"
+    mock_page.title.return_value = title_return or "Article"
+    mock_page.inner_text.return_value = "Article\nContent."
+    mock_page.evaluate.return_value = evaluate_return if evaluate_return is not None else []
+
+    mock_context = MagicMock()
+    mock_context.new_page.return_value = mock_page
+
+    mock_browser = MagicMock()
+    mock_browser.new_context.return_value = mock_context
+
+    mock_chromium = MagicMock()
+    mock_chromium.launch.return_value = mock_browser
+
+    mock_pw = MagicMock()
+    mock_pw.__enter__ = MagicMock(return_value=mock_pw)
+    mock_pw.__exit__ = MagicMock(return_value=False)
+    mock_pw.chromium = mock_chromium
+
+    return mock_pw, mock_page, mock_browser
+
+
+class TestScrapeUrlsHappyPath:
+    """scrape_urls visits pages, extracts content, follows child links."""
+
+    def test_returns_articles_from_single_url(self):
+        """Verify scrape_urls returns article dicts from a single URL."""
+        from scraper import scrape_urls
+
+        mock_pw, mock_page, _browser = _make_mock_pw(
+            evaluate_return=[{"url": "https://example.com/child", "text": "Child Page"}]
+        )
+
+        with patch("scraper.sync_playwright", return_value=mock_pw), \
+             patch("scraper._score_links", return_value=[]):
+            result = scrape_urls(["https://example.com"], "AAPL", "http://localhost:8080/v1", "model")
+
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert set(result[0].keys()) == {"title", "source", "date", "url", "snippet"}
+        assert result[0]["url"] == "https://example.com"
+
+    def test_respects_max_pages_limit(self):
+        """Verify scrape_urls stops at max_pages."""
+        from scraper import scrape_urls
+
+        mock_pw, _page, _browser = _make_mock_pw()
+
+        urls = [f"https://example.com/page{i}" for i in range(10)]
+
+        with patch("scraper.sync_playwright", return_value=mock_pw), \
+             patch("scraper._score_links", return_value=[]):
+            result = scrape_urls(urls, "AAPL", "http://localhost:8080/v1", "model", max_pages=3)
+
+        assert len(result) == 3
+
+    def test_skips_already_visited_urls(self):
+        """Verify duplicate URLs are not visited twice."""
+        from scraper import scrape_urls
+
+        mock_pw, _page, _browser = _make_mock_pw()
+
+        with patch("scraper.sync_playwright", return_value=mock_pw), \
+             patch("scraper._score_links", return_value=[]):
+            result = scrape_urls(
+                ["https://example.com", "https://example.com"],
+                "AAPL", "http://localhost:8080/v1", "model"
+            )
+
+        assert len(result) == 1
+
+
+class TestScrapeUrlsNavigationFailure:
+    """When page.goto raises, skip that page and continue."""
+
+    def test_navigation_error_skips_page(self):
+        from scraper import scrape_urls
+
+        mock_pw, mock_page, _browser = _make_mock_pw(
+            goto_side_effect=[Exception("timeout"), None]
+        )
+
+        with patch("scraper.sync_playwright", return_value=mock_pw), \
+             patch("scraper._score_links", return_value=[]):
+            result = scrape_urls(
+                ["https://example.com/fail", "https://example.com/ok"],
+                "AAPL", "http://localhost:8080/v1", "model"
+            )
+
+        assert len(result) == 1
+        assert result[0]["url"] == "https://example.com/ok"
+
+
+class TestScoreLinks:
+    """LLM-based link scoring and fallback behavior."""
+
+    def test_scores_links_with_llm(self):
+        from scraper import _score_links
+
+        mock_response = MagicMock()
+        mock_response.choices[0].message.content = "https://example.com/relevant1\nhttps://example.com/relevant2"
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = mock_response
+
+        links = [
+            {"url": "https://example.com/relevant1", "text": "AAPL earnings report"},
+            {"url": "https://example.com/relevant2", "text": "Apple stock analysis"},
+            {"url": "https://example.com/irrelevant", "text": "Weather forecast"},
+        ]
+
+        with patch("scraper.OpenAI", return_value=mock_client):
+            result = _score_links(links, "AAPL", "http://localhost:8080/v1", "model")
+
+        assert "https://example.com/relevant1" in result
+        assert "https://example.com/relevant2" in result
+
+    def test_fallback_to_first_links_on_llm_error(self):
+        from scraper import _score_links
+
+        links = [
+            {"url": "https://example.com/link1", "text": "Link 1"},
+            {"url": "https://example.com/link2", "text": "Link 2"},
+        ]
+
+        with patch("scraper.OpenAI", side_effect=Exception("LLM error")):
+            result = _score_links(links, "AAPL", "http://localhost:8080/v1", "model")
+
+        assert len(result) == 2
+        assert result[0] == "https://example.com/link1"
+
+    def test_empty_links_returns_empty(self):
+        from scraper import _score_links
+        result = _score_links([], "AAPL", "http://localhost:8080/v1", "model")
+        assert result == []

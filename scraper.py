@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import re
+from datetime import datetime, timedelta
 from urllib.parse import urlparse, urljoin
 
 from openai import OpenAI
@@ -127,8 +128,183 @@ Links:
 {links}
 """
 
-
 SKIP_EXTENSIONS = {".pdf", ".zip", ".tar", ".gz", ".doc", ".docx", ".xls", ".xlsx", ".png", ".jpg", ".jpeg", ".gif", ".mp4", ".mp3", ".avi"}
+
+# ── Reddit Helpers ────────────────────────────────────────────────────────
+
+# Matches subreddit listing URLs: reddit.com/r/<name> or reddit.com/r/<name>/hot, etc.
+_REDDIT_SUBDOMAIN_RE = re.compile(r"^https?://(www\.|old\.)?reddit\.com/")
+_REDDIT_SUBREDDIT_RE = re.compile(r"^https?://(www\.|old\.)?reddit\.com/r/[\w-]+(/(?:hot|new|top|rising|search|about|random|controversial|wiki|comments|m/.*)|/?)?$")
+_REDDIT_POST_RE = re.compile(r"^https?://(www\.|old\.)?reddit\.com/r/[\w-]+/comments/[\w-]+")
+
+
+def _is_reddit_subreddit(url: str) -> bool:
+    """Check if URL is a Reddit subreddit listing (not a specific post)."""
+    # Must not be a post URL first
+    if _is_reddit_post(url):
+        return False
+    return bool(_REDDIT_SUBREDDIT_RE.match(url))
+
+
+def _is_reddit_post(url: str) -> bool:
+    """Check if URL is a specific Reddit post."""
+    return bool(_REDDIT_POST_RE.match(url))
+
+
+def _to_old_reddit(url: str) -> str:
+    """Redirect any Reddit URL to old.reddit.com (server-rendered HTML)."""
+    parsed = urlparse(url)
+    netloc = parsed.netloc.replace("www.", "old.")
+    if "old." not in netloc:
+        netloc = netloc.replace("reddit.com", "old.reddit.com")
+    return f"{parsed.scheme}://{netloc}{parsed.path}"
+
+
+def _scrape_reddit_subreddit(page, url: str, ticker: str, visited: set) -> list[dict]:
+    """Scrape top 10 hot posts from a Reddit subreddit via old.reddit.com."""
+    # Redirect to old.reddit.com for server-rendered HTML
+    old_url = _to_old_reddit(url)
+    base = old_url.rstrip("/")
+
+    # Ensure /hot sorting
+    if "/new" not in base and "/top" not in base and "/hot" not in base and "/rising" not in base:
+        sort_url = f"{base}/hot"
+    else:
+        sort_url = re.sub(r"/(new|hot|top|rising)(/.*)?$", "/hot", base)
+
+    try:
+        page.goto(sort_url, wait_until="domcontentloaded", timeout=30000)
+    except Exception:
+        logger.warning("Failed to navigate to Reddit subreddit %s", sort_url)
+        return []
+
+    # old.reddit uses stable `a.title` selectors — no JS rendering needed
+    post_urls = page.evaluate("""() => {
+        const links = [];
+        const seen = new Set();
+        const posts = document.querySelectorAll('#siteTable a.title');
+        for (const a of posts) {
+            try {
+                const href = a.href;
+                if (!href || seen.has(href)) continue;
+                if (!/\\/r\\/[\\w-]+\\/comments\\//.test(href)) continue;
+                seen.add(href);
+                links.push(href);
+            } catch (e) {
+                continue;
+            }
+        }
+        return links.slice(0, 10);
+    }""") or []
+
+    if not post_urls:
+        logger.warning("No posts found in subreddit %s", sort_url)
+        return []
+
+    # Scrape each post
+    articles = []
+    for post_url in post_urls:
+        result = _scrape_reddit_post(page, post_url, visited)
+        if result:
+            articles.append(result)
+
+    return articles
+
+
+def _scrape_reddit_post(page, url: str, visited: set) -> dict | None:
+    """Scrape content from a single Reddit post via old.reddit.com."""
+    # Normalize and check visited
+    parsed = urlparse(url)
+    normalized = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    if normalized in visited:
+        return None
+    visited.add(normalized)
+
+    # Redirect to old.reddit.com for server-rendered HTML
+    old_url = _to_old_reddit(url)
+
+    try:
+        page.goto(old_url, wait_until="domcontentloaded", timeout=30000)
+    except Exception:
+        logger.warning("Failed to navigate to Reddit post %s", old_url)
+        return None
+
+    # Use trafilatura for robust body extraction (works great on server-rendered HTML)
+    try:
+        html = page.content()
+        body = trafilatura.extract(html, include_comments=False, include_tables=False) or ""
+    except Exception:
+        body = ""
+
+    # Extract title from page
+    try:
+        title = page.title() or ""
+    except Exception:
+        title = ""
+
+    # Extract top 10 comments using old.reddit's stable selectors
+    comments = page.evaluate("""() => {
+        const comments = [];
+        const seen = new Set();
+        const commentThings = document.querySelectorAll('.thing[data-type="comment"]');
+        for (const thing of commentThings) {
+            try {
+                const md = thing.querySelector('.md');
+                if (!md) continue;
+                const text = md.textContent.trim();
+                if (!text || seen.has(text)) continue;
+                seen.add(text);
+                comments.push(text);
+                if (comments.length >= 10) break;
+            } catch (e) {
+                continue;
+            }
+        }
+        return comments;
+    }""") or []
+
+    # Combine body and comments
+    full_text = body or ""
+    if comments:
+        comment_block = "\n\n".join(comments)
+        full_text = f"{body}\n\n--- Top Comments ---\n\n{comment_block}" if body else comment_block
+
+    if not full_text.strip():
+        logger.warning("No content extracted from Reddit post %s", url)
+        return None
+
+    # Extract subreddit name from URL
+    subreddit_match = re.search(r"/r/([\w-]+)", url)
+    source = f"reddit.com/r/{subreddit_match.group(1)}" if subreddit_match else "reddit.com"
+
+    return {
+        "title": title or url,
+        "source": source,
+        "date": "",
+        "url": url,
+        "snippet": full_text,
+    }
+
+
+def _is_recent(date_str: str, cutoff: datetime) -> bool:
+    """Check if a date string represents a date after the cutoff.
+
+    Returns True if the date is empty (unknown — assume recent) or parses to a
+    date after the cutoff.
+    """
+    if not date_str:
+        return True  # Unknown date — keep it
+
+    # Try common date formats
+    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ", "%B %d, %Y", "%b %d, %Y", "%d %B %Y", "%d %b %Y"):
+        try:
+            dt = datetime.strptime(date_str.strip(), fmt)
+            return dt >= cutoff
+        except ValueError:
+            continue
+
+    # If we can't parse it, keep it (better to include than exclude)
+    return True
 
 
 def _visit_page(page, url: str, ticker: str, visited: set) -> tuple[dict, list[str]] | None:
@@ -185,6 +361,16 @@ def _visit_page(page, url: str, ticker: str, visited: set) -> tuple[dict, list[s
     # Extract source (domain name)
     source = parsed.netloc.replace("www.", "")
 
+    # Extract date from metadata
+    date_str = ""
+    try:
+        html = page.content()
+        doc = trafilatura.extract_metadata(html, default_url=url)
+        if doc and doc.date:
+            date_str = doc.date
+    except Exception:
+        pass
+
     # Extract links from the page
     links = page.evaluate("""() => {
         const anchors = document.querySelectorAll('a[href]');
@@ -211,7 +397,7 @@ def _visit_page(page, url: str, ticker: str, visited: set) -> tuple[dict, list[s
     article = {
         "title": title,
         "source": source,
-        "date": "",
+        "date": date_str,
         "url": url,
         "snippet": text[:500] if len(text) > 500 else text,
     }
@@ -287,7 +473,7 @@ def scrape_urls(
     Returns:
         List of dicts with keys: title, source, date, url, snippet.
     """
-    # Filter valid URLs
+   # Filter valid URLs
     valid_urls = [u.strip() for u in urls if u and u.strip()]
     if not valid_urls:
         return []
@@ -295,6 +481,9 @@ def scrape_urls(
     ticker = ticker.strip().upper()
     articles = []
     visited = set()
+
+    # Only keep articles from the last 30 days
+    cutoff = datetime.now() - timedelta(days=30)
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
@@ -305,14 +494,29 @@ def scrape_urls(
         page = context.new_page()
 
         try:
-            # Level 1: Visit provided URLs
+            # Level 1: Visit provided URLs (with special handling for Reddit)
             seed_links = valid_urls
 
-            # Level 2: Follow relevant child links
+            # Level 2: Follow relevant child links (not for Reddit URLs)
             child_links = []
             for url in seed_links:
                 if len(articles) >= max_pages:
                     break
+
+                # Handle Reddit subreddits — extract top 10 recent posts
+                if _is_reddit_subreddit(url):
+                    reddit_articles = _scrape_reddit_subreddit(page, url, ticker, visited)
+                    articles.extend(reddit_articles)
+                    continue
+
+                # Handle Reddit posts — scrape content directly
+                if _is_reddit_post(url):
+                    result = _scrape_reddit_post(page, url, visited)
+                    if result:
+                        articles.append(result)
+                    continue
+
+                # Default: regular page scraping
                 result = _visit_page(page, url, ticker, visited)
                 if result is None:
                     continue
@@ -337,4 +541,11 @@ def scrape_urls(
         finally:
             browser.close()
 
-    return articles
+    # Filter out old articles — only keep those from the last 30 days
+    recent = []
+    for a in articles:
+        if _is_recent(a.get("date", ""), cutoff):
+            recent.append(a)
+        else:
+            logger.info("Skipping old article (%s): %s", a.get("date", ""), a.get("url", ""))
+    return recent

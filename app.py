@@ -58,10 +58,16 @@ if "custom_thinking" not in st.session_state:
     st.session_state.custom_thinking = None
 if "custom_summary_error" not in st.session_state:
     st.session_state.custom_summary_error = None
+if "progress_step" not in st.session_state:
+    st.session_state.progress_step = None
+if "progress_messages" not in st.session_state:
+    st.session_state.progress_messages = []
+if "progress_done" not in st.session_state:
+    st.session_state.progress_done = False
 
 
 def on_get_news():
-    """Callback for the Get News button."""
+    """Callback for the Get News button — resets state and starts step 1."""
     st.session_state.articles = None
     st.session_state.summary = None
     st.session_state.thinking = None
@@ -70,54 +76,80 @@ def on_get_news():
     st.session_state.custom_summary = None
     st.session_state.custom_thinking = None
     st.session_state.custom_summary_error = None
+    st.session_state.progress_step = 1
+    st.session_state.progress_messages = []
+    st.session_state.progress_done = False
+    st.session_state._custom_urls = [u.strip() for u in custom_urls_text.split("\n") if u.strip()] if custom_urls_text.strip() else []
+    st.rerun()
 
-    # Parse custom URLs
-    custom_urls = [u.strip() for u in custom_urls_text.split("\n") if u.strip()] if custom_urls_text.strip() else []
 
-    # Step 1: Scrape Yahoo Finance
-    with st.spinner(f"Scraping news for **{ticker}**..."):
+def run_progress_step():
+    """Execute one step of the pipeline, then rerun to update the UI."""
+    step = st.session_state.progress_step
+    custom_urls = st.session_state.get("_custom_urls", [])
+
+    if step == 1:
+        # Scrape Yahoo Finance
+        st.session_state.progress_messages.append(f"🔍 Scraping Yahoo Finance for **{ticker}**...")
         try:
             st.session_state.articles = scrape_news(ticker)
+            st.session_state.progress_messages.append(f"✅ Found **{len(st.session_state.articles)}** article(s) from Yahoo Finance")
         except Exception as e:
-            st.error(f"Failed to scrape news: {e}")
-            st.info("Tip: Make sure Playwright browsers are installed — run `playwright install chromium`")
+            st.session_state.progress_messages.append(f"❌ Yahoo Finance scraping failed: {e}")
             st.session_state.articles = []
+        st.session_state.progress_step = 2
+        st.rerun()
 
-    # Step 1b: Scrape custom sources if provided
-    if custom_urls:
-        with st.spinner(f"Exploring {len(custom_urls)} custom source(s)..."):
+    elif step == 2:
+        # Scrape custom sources (if any)
+        if custom_urls:
+            st.session_state.progress_messages.append(f"🔗 Exploring **{len(custom_urls)}** custom source(s)...")
             try:
                 from scraper import scrape_urls
                 st.session_state.custom_articles = scrape_urls(
                     custom_urls, ticker, llm_url, model
                 )
+                st.session_state.progress_messages.append(f"✅ Extracted **{len(st.session_state.custom_articles)}** article(s) from custom sources")
             except Exception as e:
-                st.error(f"Failed to scrape custom sources: {e}")
+                st.session_state.progress_messages.append(f"❌ Custom source scraping failed: {e}")
                 st.session_state.custom_articles = []
+        st.session_state.progress_step = 3
+        st.rerun()
 
-    # Step 2: Summarize Yahoo articles
-    if st.session_state.articles:
-        with st.spinner("Summarizing Yahoo Finance news..."):
+    elif step == 3:
+        # Summarize Yahoo articles
+        if st.session_state.articles:
+            st.session_state.progress_messages.append(f"🤖 Summarizing **{len(st.session_state.articles)}** Yahoo Finance article(s) with LLM...")
             try:
                 result = summarize_news(
                     st.session_state.articles, llm_url, model
                 )
                 st.session_state.summary = result["summary"]
                 st.session_state.thinking = result["thinking"]
+                st.session_state.progress_messages.append("✅ Yahoo Finance summary complete")
             except Exception as e:
                 st.session_state.summary_error = str(e)
+                st.session_state.progress_messages.append(f"❌ Yahoo Finance summarization failed: {e}")
+        st.session_state.progress_step = 4
+        st.rerun()
 
-    # Step 2b: Summarize custom articles
-    if st.session_state.custom_articles:
-        with st.spinner("Summarizing custom sources..."):
+    elif step == 4:
+        # Summarize custom articles
+        if st.session_state.custom_articles:
+            st.session_state.progress_messages.append(f"🤖 Summarizing **{len(st.session_state.custom_articles)}** custom source article(s) with LLM...")
             try:
                 result = summarize_news(
                     st.session_state.custom_articles, llm_url, model
                 )
                 st.session_state.custom_summary = result["summary"]
                 st.session_state.custom_thinking = result["thinking"]
+                st.session_state.progress_messages.append("✅ Custom sources summary complete")
             except Exception as e:
                 st.session_state.custom_summary_error = str(e)
+                st.session_state.progress_messages.append(f"❌ Custom sources summarization failed: {e}")
+        st.session_state.progress_step = None
+        st.session_state.progress_done = True
+        st.rerun()
 
 
 def _render_summary(summary, summary_error, thinking, llm_url, model):
@@ -144,7 +176,19 @@ if not ticker:
 elif not llm_url or not model:
     st.warning("Configure your LLM settings in the sidebar.")
 else:
-    st.button("📰 Get News", type="primary", use_container_width=True, on_click=on_get_news)
+    is_working = st.session_state.progress_step is not None
+    st.button("📰 Get News", type="primary", use_container_width=True, on_click=on_get_news, disabled=is_working)
+
+    # Progress status box — renders from session state, updates via rerun()
+    if is_working:
+        with st.status(f"🔍 Gathering news for **{ticker}**...", expanded=True) as status:
+            for msg in st.session_state.progress_messages:
+                status.markdown(msg)
+            status.markdown("⏳ Working...")
+    elif st.session_state.progress_done:
+        with st.status("✅ Done — results below", state="complete", expanded=False) as status:
+            for msg in st.session_state.progress_messages:
+                status.markdown(msg)
 
     # Show articles if we have them (is not None = button was clicked)
     if st.session_state.articles is not None:
@@ -228,3 +272,7 @@ else:
                 )
 
     st.caption("News sourced from Yahoo Finance · Summarized by your local LLM")
+
+# ── Run next progress step (after UI renders, triggers rerun) ──
+if st.session_state.progress_step is not None:
+    run_progress_step()

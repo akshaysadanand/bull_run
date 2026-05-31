@@ -20,14 +20,20 @@ ticker = st.text_input(
 # --- Sidebar Configuration ---
 with st.sidebar:
     st.header("LLM Settings")
-    llm_url = st.text_input(
+    llm_url = st.selectbox(
         "LLM Base URL",
-        value="http://localhost:8080/v1",
+        options=[
+            "http://localhost:8080/v1",
+            "http://localhost:8081/v1",
+        ],
         help="OpenAI-compatible chat completions base URL (e.g., Ollama, LM Studio)",
     )
-    model = st.text_input(
+    model = st.selectbox(
         "Model Name",
-        value="Qwen3.6-27B-Q8_0.gguf",
+        options=[
+            "Qwen3.6-27B-Q8_0.gguf",
+            "Qwen3.5-9B-Q8_0.gguf",
+        ],
         help="Model name as configured on your LLM server",
     )
 

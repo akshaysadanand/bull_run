@@ -9,6 +9,7 @@ A local-first stock news aggregator that scrapes financial news and uses a local
 
 ## Features
 
+
 - **Ticker-based news scraping** — Enter any stock ticker and get the latest news from Yahoo Finance
 - **Local LLM summarization** — Summaries powered by any OpenAI-compatible local LLM (Ollama, LM Studio, etc.)
 - **Custom sources** — Add your own URLs to explore investor pages, earnings reports, or any relevant content

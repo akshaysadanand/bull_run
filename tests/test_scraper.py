@@ -276,6 +276,24 @@ class TestScrapeUrlsHappyPath:
 
         assert len(result) == 1
 
+    def test_skips_pdf_urls(self):
+        """Verify PDF URLs are skipped without attempting navigation."""
+        from scraper import scrape_urls
+
+        mock_pw, mock_page, _browser = _make_mock_pw()
+
+        with patch("scraper.sync_playwright", return_value=mock_pw), \
+             patch("scraper._score_links", return_value=[]):
+            result = scrape_urls(
+                ["https://example.com/report.pdf", "https://example.com/page"],
+                "AAPL", "http://localhost:8080/v1", "model"
+            )
+
+        assert len(result) == 1
+        assert result[0]["url"] == "https://example.com/page"
+        # PDF URL should not have triggered navigation
+        assert mock_page.goto.call_count == 1
+
 
 class TestScrapeUrlsNavigationFailure:
     """When page.goto raises, skip that page and continue."""

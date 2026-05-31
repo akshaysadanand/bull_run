@@ -1,6 +1,7 @@
 """Scrape stock news from Yahoo Finance using Playwright."""
 
 import logging
+import os
 import random
 import re
 from urllib.parse import urlparse, urljoin
@@ -127,6 +128,9 @@ Links:
 """
 
 
+SKIP_EXTENSIONS = {".pdf", ".zip", ".tar", ".gz", ".doc", ".docx", ".xls", ".xlsx", ".png", ".jpg", ".jpeg", ".gif", ".mp4", ".mp3", ".avi"}
+
+
 def _visit_page(page, url: str, ticker: str, visited: set) -> tuple[dict, list[str]] | None:
     """Visit a single page, extract content and links.
 
@@ -145,6 +149,12 @@ def _visit_page(page, url: str, ticker: str, visited: set) -> tuple[dict, list[s
     if normalized in visited:
         return None
     visited.add(normalized)
+
+    # Skip non-HTML resources (PDFs, images, archives, etc.)
+    ext = os.path.splitext(parsed.path)[1].lower()
+    if ext in SKIP_EXTENSIONS:
+        logger.info("Skipping non-HTML resource: %s", url)
+        return None
 
     # Navigate
     try:

@@ -1,7 +1,10 @@
 """Scrape stock news from Yahoo Finance using Playwright."""
 
+import logging
 import random
 from playwright.sync_api import sync_playwright
+
+logger = logging.getLogger(__name__)
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
@@ -16,6 +19,10 @@ def scrape_news(ticker: str) -> list[dict]:
     Returns a list of dicts with keys: title, source, date, url, snippet.
     Max 15 articles. Returns empty list on failure.
     """
+    ticker = ticker.strip().upper()
+    if not ticker:
+        return []
+
     url = f"https://finance.yahoo.com/quote/{ticker}/news/"
 
     with sync_playwright() as pw:
@@ -29,6 +36,7 @@ def scrape_news(ticker: str) -> list[dict]:
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
         except Exception:
+            logger.exception("Failed to navigate to %s", url)
             browser.close()
             return []
 
@@ -36,6 +44,7 @@ def scrape_news(ticker: str) -> list[dict]:
         try:
             page.wait_for_selector('[data-testid="news-stream"]', timeout=15000)
         except Exception:
+            logger.exception("News stream not found for %s", ticker)
             browser.close()
             return []
 
@@ -65,10 +74,10 @@ def scrape_news(ticker: str) -> list[dict]:
                     if (publishing) {
                         const text = publishing.textContent.trim();
                         // Format: "Source Name • Xh ago" or "Source Name • X days ago"
-                        const parts = text.split('\\u2022');
+                        const parts = text.split('•');
                         if (parts.length >= 2) {
                             source = parts[0].trim();
-                            date = parts.slice(1).join('\\u2022').trim();
+                            date = parts.slice(1).join('•').trim();
                         } else {
                             source = text;
                         }

@@ -103,4 +103,7 @@ def scrape_news(ticker: str) -> list[dict]:
 
         browser.close()
 
+    # Keep only articles that actually mention the ticker in the title
+    articles = [a for a in articles if ticker in a.get("title", "")]
+
     return articles or []

@@ -8,12 +8,17 @@ st.set_page_config(page_title="Bull Run — Stock News Aggregator", layout="wide
 
 st.title("🐂 Bull Run — Stock News Aggregator")
 
+# --- Stock Ticker Selector (main panel) ---
+ticker = st.text_input(
+    "Stock Ticker",
+    value="AAPL",
+    max_chars=5,
+    label_visibility="collapsed",
+).upper().strip()
+
 
 # --- Sidebar Configuration ---
 with st.sidebar:
-    st.header("Configuration")
-    ticker = st.text_input("Stock Ticker", value="AAPL", max_chars=5).upper().strip()
-    st.divider()
     st.header("LLM Settings")
     llm_url = st.text_input(
         "LLM Base URL",
@@ -22,7 +27,7 @@ with st.sidebar:
     )
     model = st.text_input(
         "Model Name",
-        value="llama3",
+        value="Qwen3.6-27B-Q8_0.gguf",
         help="Model name as configured on your LLM server",
     )
 
@@ -32,6 +37,8 @@ if "articles" not in st.session_state:
     st.session_state.articles = None
 if "summary" not in st.session_state:
     st.session_state.summary = None
+if "thinking" not in st.session_state:
+    st.session_state.thinking = None
 if "summary_error" not in st.session_state:
     st.session_state.summary_error = None
 
@@ -40,6 +47,7 @@ def on_get_news():
     """Callback for the Get News button."""
     st.session_state.articles = None
     st.session_state.summary = None
+    st.session_state.thinking = None
     st.session_state.summary_error = None
 
     # Step 1: Scrape
@@ -56,9 +64,11 @@ def on_get_news():
     if st.session_state.articles:
         with st.spinner("Summarizing with LLM..."):
             try:
-                st.session_state.summary = summarize_news(
+                result = summarize_news(
                     st.session_state.articles, llm_url, model
                 )
+                st.session_state.summary = result["summary"]
+                st.session_state.thinking = result["thinking"]
             except Exception as e:
                 st.session_state.summary_error = str(e)
 
@@ -96,8 +106,17 @@ else:
         if st.session_state.summary_error:
             st.error(f"LLM summarization failed: {st.session_state.summary_error}")
             st.info(f"Check that your LLM server is running at **{llm_url}** with model **{model}**")
-        elif st.session_state.summary:
-            st.markdown(st.session_state.summary)
+        elif st.session_state.summary is not None:
+            # Summary was computed (button was clicked)
+            if st.session_state.summary.strip():
+                st.markdown(st.session_state.summary)
+            else:
+                st.warning("The LLM returned an empty summary. Try a different model or check your LLM server.")
+
+            # Show model's chain-of-thought in a collapsible expander
+            if st.session_state.thinking:
+                with st.expander("🧠 Model's Reasoning Process"):
+                    st.markdown(st.session_state.thinking)
         else:
             st.info("Waiting for results... Click **Get News** to start.")
 

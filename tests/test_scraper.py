@@ -176,3 +176,22 @@ class TestScrapeNewsEdgeCases:
             result = scrape_news("AAPL")
 
         assert result == []
+
+
+class TestScrapeUrlsEmptyInput:
+    """Empty or invalid inputs should return [] immediately."""
+
+    def test_empty_url_list_returns_empty_list(self):
+        from scraper import scrape_urls
+        result = scrape_urls([], "AAPL", "http://localhost:8080/v1", "model")
+        assert result == []
+
+    def test_none_url_in_list_returns_empty_list(self):
+        from scraper import scrape_urls
+        result = scrape_urls([None], "AAPL", "http://localhost:8080/v1", "model")
+        assert result == []
+
+    def test_whitespace_only_urls_returns_empty_list(self):
+        from scraper import scrape_urls
+        result = scrape_urls(["  ", ""], "AAPL", "http://localhost:8080/v1", "model")
+        assert result == []

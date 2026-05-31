@@ -36,3 +36,5 @@ Thumbs.db
 
 # Test artifacts
 _test_*.py
+
+/.vscode/

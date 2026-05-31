@@ -31,7 +31,7 @@ def test_summarize_news_returns_llm_response():
     assert "AAPL Beats Earnings" in call_args.kwargs["messages"][1]["content"]
     assert "Supply Chain Concerns" in call_args.kwargs["messages"][1]["content"]
 
-    assert "Summary" in result
+    assert "Summary" in result["summary"]
 
 
 def test_summarize_news_handles_empty_articles():
@@ -45,11 +45,13 @@ def test_summarize_news_handles_empty_articles():
     with patch("summarizer.OpenAI", return_value=mock_client):
         result = summarize_news([], "http://localhost:8080/v1", "llama3")
 
-    assert isinstance(result, str)
+    assert isinstance(result, dict)
+    assert "summary" in result
+    assert "thinking" in result
 
 
 def test_summarize_news_handles_empty_llm_response():
-    """Verify summarize_news returns empty string when LLM returns None content."""
+    """Verify summarize_news returns empty dict values when LLM returns None content."""
     mock_response = MagicMock()
     mock_response.choices[0].message.content = None
 
@@ -59,4 +61,4 @@ def test_summarize_news_handles_empty_llm_response():
     with patch("summarizer.OpenAI", return_value=mock_client):
         result = summarize_news([{"title": "Test", "source": "", "date": "", "snippet": ""}], "http://localhost:8080/v1", "llama3")
 
-    assert result == ""
+    assert result == {"summary": "", "thinking": ""}

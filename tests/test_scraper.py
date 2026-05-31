@@ -40,10 +40,10 @@ def _make_mock_chain(articles: list[dict] | None, raise_goto: bool = False,
     return mock_pw, mock_page, mock_browser
 
 
-def _sample_articles(count: int) -> list[dict]:
+def _sample_articles(count: int, ticker: str = "AAPL") -> list[dict]:
     return [
         {
-            "title": f"Article {i}",
+            "title": f"{ticker} Article {i}",
             "source": f"Source {i}",
             "date": f"{i}h ago",
             "url": f"https://example.com/article{i}",

@@ -154,7 +154,3 @@ Detailed design specs and implementation plans are available in `docs/superpower
 | No articles scraped | Yahoo Finance may have changed their DOM — check `scraper.py` selectors |
 | Summary is empty or garbled | Try a larger model or increase LLM context window |
 | Custom sources timeout | Some sites block headless browsers; try adding a longer timeout in `scraper.py` |
-
-## License
-
-MIT

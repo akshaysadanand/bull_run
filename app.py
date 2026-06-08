@@ -47,14 +47,80 @@ st.set_page_config(page_title="Bull Run — Stock News Aggregator", layout="wide
 
 st.title("🐂 Bull Run — Stock News Aggregator")
 
+# --- Preset Selector Row ---
+_presets = load_presets()
+_preset_names = [p["name"] for p in _presets] if _presets else []
+
+if "preset_selector" not in st.session_state:
+    st.session_state.preset_selector = ""
+if "_preset_ticker" not in st.session_state:
+    st.session_state._preset_ticker = None
+if "_preset_urls_raw" not in st.session_state:
+    st.session_state._preset_urls_raw = None
+
+
+def on_preset_run():
+    """Callback for preset Run button — loads preset data then triggers news."""
+    _preset_name = st.session_state.get("preset_selector", "")
+    _presets_local = load_presets()
+    _preset_data = next((p for p in _presets_local if p["name"] == _preset_name), None)
+    if _preset_data:
+        st.session_state._preset_ticker = _preset_data["ticker"]
+        st.session_state._preset_urls_raw = _preset_data.get("custom_urls", [])
+    on_get_news()
+
+
+def on_preset_save():
+    """Callback for preset Save button — saves current ticker + sources as a preset."""
+    _name = st.session_state.get("_preset_name_input", "").strip()
+    if not _name:
+        st.error("Preset name is required")
+        return
+    _ticker_val = st.session_state.get("_current_ticker", ticker)
+    _urls_raw = [u.strip() for u in st.session_state.get("_current_urls", "").split("\n") if u.strip()]
+    ok = save_preset(_name, _ticker_val, _urls_raw)
+    if ok:
+        st.toast(f"Preset '{_name}' saved!")
+        st.rerun()
+    else:
+        st.error(f"Preset '{_name}' already exists — choose a different name")
+
+
+if _preset_names:
+    cols = st.columns([3, 0.8, 0.8, 0.2])
+    with cols[0]:
+        st.selectbox(
+            "Quick Presets",
+            options=_preset_names,
+            key="preset_selector",
+            help="Select a preset to load ticker + custom sources",
+        )
+        # Auto-apply preset to session state when selection changes
+        if st.session_state.preset_selector:
+            _preset_data = next((p for p in _presets if p["name"] == st.session_state.preset_selector), None)
+            if _preset_data:
+                st.session_state._preset_ticker = _preset_data["ticker"]
+                st.session_state._preset_urls_raw = _preset_data.get("custom_urls", [])
+    with cols[1]:
+        st.button("▶ Run", use_container_width=True, disabled=not st.session_state.preset_selector or st.session_state.progress_step is not None, help="Run news for selected preset", on_click=on_preset_run)
+    with cols[2]:
+        st.button("+ Save", use_container_width=True, help="Save current ticker + sources as a preset", on_click=on_preset_save)
+    with cols[3]:
+        st.empty()
+else:
+    st.info("No presets yet — save one below or create `presets.json`.")
+
 # --- Stock Ticker Selector (main panel) ---
+_ticker_default = st.session_state._preset_ticker if st.session_state._preset_ticker else "AAPL"
 ticker = st.text_input(
     "Stock Ticker",
-    value="AAPL",
+    value=_ticker_default,
     max_chars=5,
     label_visibility="collapsed",
 ).upper().strip()
 
+# Store current values for save preset callback
+st.session_state._current_ticker = ticker
 
 # --- Sidebar Configuration ---
 with st.sidebar:
@@ -79,11 +145,23 @@ with st.sidebar:
     st.divider()
 
     st.header("Custom Sources")
+    _custom_default = "\n".join(st.session_state._preset_urls_raw) if st.session_state._preset_urls_raw else ""
     custom_urls_text = st.text_area(
         "Custom URLs (one per line)",
+        value=_custom_default,
         help="Explore custom pages for additional insights (max 20 pages)",
         placeholder="https://example.com/news\nhttps://investor.example.com/earnings",
+        key="custom_urls_area",
     )
+
+    st.divider()
+    st.header("Save Preset")
+    _preset_name = st.text_input(
+        "Preset Name",
+        key="_preset_name_input",
+        help="Name for this preset (e.g., 'Apple', 'Tesla')",
+    )
+    st.session_state._current_urls = custom_urls_text
 
 
 # --- State Management ---
@@ -124,7 +202,15 @@ def on_get_news():
     st.session_state.progress_step = 1
     st.session_state.progress_messages = []
     st.session_state.progress_done = False
-    st.session_state._custom_urls = [u.strip() for u in custom_urls_text.split("\n") if u.strip()] if custom_urls_text.strip() else []
+    # Use preset URLs if set, otherwise parse from text area
+    if st.session_state.get("_preset_urls_raw"):
+        st.session_state._custom_urls = st.session_state._preset_urls_raw
+    else:
+        _urls_text = st.session_state.get("_current_urls", "")
+        st.session_state._custom_urls = [u.strip() for u in _urls_text.split("\n") if u.strip()] if _urls_text.strip() else []
+    # Clear preset override after use so ticker input isn't locked
+    st.session_state._preset_ticker = None
+    st.session_state._preset_urls_raw = None
     st.rerun()
 
 

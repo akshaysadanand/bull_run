@@ -45,18 +45,41 @@ def save_preset(name: str, ticker: str, custom_urls: list[str]) -> bool:
 
 st.set_page_config(page_title="Bull Run — Stock News Aggregator", layout="wide")
 
-st.title("🐂 Bull Run — Stock News Aggregator")
-
-# --- Preset Selector Row ---
-_presets = load_presets()
-_preset_names = [p["name"] for p in _presets] if _presets else []
-
+# --- State Management (must be before any UI that references these keys) ---
+if "articles" not in st.session_state:
+    st.session_state.articles = None
+if "summary" not in st.session_state:
+    st.session_state.summary = None
+if "thinking" not in st.session_state:
+    st.session_state.thinking = None
+if "summary_error" not in st.session_state:
+    st.session_state.summary_error = None
+if "custom_articles" not in st.session_state:
+    st.session_state.custom_articles = None
+if "custom_summary" not in st.session_state:
+    st.session_state.custom_summary = None
+if "custom_thinking" not in st.session_state:
+    st.session_state.custom_thinking = None
+if "custom_summary_error" not in st.session_state:
+    st.session_state.custom_summary_error = None
+if "progress_step" not in st.session_state:
+    st.session_state.progress_step = None
+if "progress_messages" not in st.session_state:
+    st.session_state.progress_messages = []
+if "progress_done" not in st.session_state:
+    st.session_state.progress_done = False
 if "preset_selector" not in st.session_state:
     st.session_state.preset_selector = ""
 if "_preset_ticker" not in st.session_state:
     st.session_state._preset_ticker = None
 if "_preset_urls_raw" not in st.session_state:
     st.session_state._preset_urls_raw = None
+
+st.title("🐂 Bull Run — Stock News Aggregator")
+
+# --- Preset Selector Row ---
+_presets = load_presets()
+_preset_names = [p["name"] for p in _presets] if _presets else []
 
 
 def on_preset_run():
@@ -162,31 +185,6 @@ with st.sidebar:
         help="Name for this preset (e.g., 'Apple', 'Tesla')",
     )
     st.session_state._current_urls = custom_urls_text
-
-
-# --- State Management ---
-if "articles" not in st.session_state:
-    st.session_state.articles = None
-if "summary" not in st.session_state:
-    st.session_state.summary = None
-if "thinking" not in st.session_state:
-    st.session_state.thinking = None
-if "summary_error" not in st.session_state:
-    st.session_state.summary_error = None
-if "custom_articles" not in st.session_state:
-    st.session_state.custom_articles = None
-if "custom_summary" not in st.session_state:
-    st.session_state.custom_summary = None
-if "custom_thinking" not in st.session_state:
-    st.session_state.custom_thinking = None
-if "custom_summary_error" not in st.session_state:
-    st.session_state.custom_summary_error = None
-if "progress_step" not in st.session_state:
-    st.session_state.progress_step = None
-if "progress_messages" not in st.session_state:
-    st.session_state.progress_messages = []
-if "progress_done" not in st.session_state:
-    st.session_state.progress_done = False
 
 
 def on_get_news():

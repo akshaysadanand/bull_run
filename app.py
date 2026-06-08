@@ -1,8 +1,47 @@
 """Streamlit UI for the stock news aggregator."""
 
+import json
+from pathlib import Path
+
 import streamlit as st
 from scraper import scrape_news
 from summarizer import summarize_news
+
+PRESETS_FILE = Path(__file__).parent / "presets.json"
+
+
+def load_presets() -> list[dict]:
+    """Load presets from presets.json. Returns empty list on any error."""
+    path = Path(PRESETS_FILE)
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text())
+        if not isinstance(data, list):
+            return []
+        return data
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def save_preset(name: str, ticker: str, custom_urls: list[str]) -> bool:
+    """Append a preset to presets.json. Returns False if name already exists."""
+    if not name.strip():
+        return False
+
+    presets = load_presets()
+    for p in presets:
+        if p.get("name", "").strip().upper() == name.strip().upper():
+            return False
+
+    presets.append({
+        "name": name.strip(),
+        "ticker": ticker.strip().upper(),
+        "custom_urls": custom_urls,
+    })
+    Path(PRESETS_FILE).write_text(json.dumps(presets, indent=2) + "\n")
+    return True
+
 
 st.set_page_config(page_title="Bull Run — Stock News Aggregator", layout="wide")
 

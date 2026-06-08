@@ -21,13 +21,8 @@ def test_load_presets_returns_list(presets_file: Path, monkeypatch: pytest.Monke
 
 def test_load_presets_missing_file_returns_empty(presets_file: Path, monkeypatch: pytest.MonkeyPatch):
     """Loading a non-existent presets.json returns an empty list."""
-    monkeypatch.setattr("app.PRESETS_FILE", str(presets_file))
-
-    # Remove cached module if already imported
-    import sys
-    if "app" in sys.modules:
-        del sys.modules["app"]
     from app import load_presets
+    monkeypatch.setattr("app.PRESETS_FILE", str(presets_file))
 
     result = load_presets()
     assert result == []
@@ -36,12 +31,8 @@ def test_load_presets_missing_file_returns_empty(presets_file: Path, monkeypatch
 def test_load_presets_invalid_json_returns_empty(presets_file: Path, monkeypatch: pytest.MonkeyPatch):
     """Loading a malformed presets.json returns an empty list."""
     presets_file.write_text("{invalid json")
-    monkeypatch.setattr("app.PRESETS_FILE", str(presets_file))
-
-    import sys
-    if "app" in sys.modules:
-        del sys.modules["app"]
     from app import load_presets
+    monkeypatch.setattr("app.PRESETS_FILE", str(presets_file))
 
     result = load_presets()
     assert result == []
@@ -51,12 +42,8 @@ def test_save_preset_appends_to_file(presets_file: Path, monkeypatch: pytest.Mon
     """Saving a preset appends it to the existing presets.json."""
     data = [{"name": "Existing", "ticker": "EXS", "custom_urls": []}]
     presets_file.write_text(json.dumps(data))
-    monkeypatch.setattr("app.PRESETS_FILE", str(presets_file))
-
-    import sys
-    if "app" in sys.modules:
-        del sys.modules["app"]
     from app import save_preset
+    monkeypatch.setattr("app.PRESETS_FILE", str(presets_file))
 
     result = save_preset("New Preset", "NWP", ["https://example.com"])
     assert result is True
@@ -71,12 +58,8 @@ def test_save_preset_rejects_duplicate_name(presets_file: Path, monkeypatch: pyt
     """Saving a preset with a duplicate name returns False."""
     data = [{"name": "Existing", "ticker": "EXS", "custom_urls": []}]
     presets_file.write_text(json.dumps(data))
-    monkeypatch.setattr("app.PRESETS_FILE", str(presets_file))
-
-    import sys
-    if "app" in sys.modules:
-        del sys.modules["app"]
     from app import save_preset
+    monkeypatch.setattr("app.PRESETS_FILE", str(presets_file))
 
     result = save_preset("Existing", "XXX", [])
     assert result is False
@@ -84,12 +67,8 @@ def test_save_preset_rejects_duplicate_name(presets_file: Path, monkeypatch: pyt
 
 def test_save_preset_creates_file_if_missing(presets_file: Path, monkeypatch: pytest.MonkeyPatch):
     """Saving a preset creates presets.json if it doesn't exist."""
-    monkeypatch.setattr("app.PRESETS_FILE", str(presets_file))
-
-    import sys
-    if "app" in sys.modules:
-        del sys.modules["app"]
     from app import save_preset
+    monkeypatch.setattr("app.PRESETS_FILE", str(presets_file))
 
     result = save_preset("First", "FST", [])
     assert result is True

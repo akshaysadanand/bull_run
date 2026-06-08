@@ -490,8 +490,15 @@ def scrape_urls(
         context = browser.new_context(
             user_agent=random.choice(USER_AGENTS),
             viewport={"width": 1280, "height": 720},
+            extra_http_headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
         )
         page = context.new_page()
+
+        # Hide webdriver flag — Reddit (and other sites) use this to detect headless browsers
+        page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
         try:
             # Level 1: Visit provided URLs (with special handling for Reddit)

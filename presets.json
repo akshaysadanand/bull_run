@@ -2,7 +2,7 @@
   {
     "name": "AST SpaceMobile",
     "ticker": "ASTS",
-    "custom_urls": []
+    "custom_urls": ["https://www.reddit.com/r/ASTSpaceMobile/"]
   },
   {
     "name": "Rocket Lab",
@@ -12,6 +12,6 @@
   {
     "name": "GameStop",
     "ticker": "GME",
-    "custom_urls": []
+    "custom_urls": ["https://www.reddit.com/r/superstonk/"]
   }
 ]

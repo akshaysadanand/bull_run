@@ -1,0 +1,17 @@
+[
+  {
+    "name": "AST SpaceMobile",
+    "ticker": "ASTS",
+    "custom_urls": ["https://www.reddit.com/r/ASTSpaceMobile/"]
+  },
+  {
+    "name": "Rocket Lab",
+    "ticker": "RKLB",
+    "custom_urls": []
+  },
+  {
+    "name": "GameStop",
+    "ticker": "GME",
+    "custom_urls": ["https://www.reddit.com/r/superstonk/"]
+  }
+]

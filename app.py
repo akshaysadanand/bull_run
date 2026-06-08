@@ -1,53 +1,51 @@
 """Streamlit UI for the stock news aggregator."""
 
+import json
+from pathlib import Path
+
 import streamlit as st
 from scraper import scrape_news
 from summarizer import summarize_news
 
+PRESETS_FILE = Path(__file__).parent / "presets.json"
+
+
+def load_presets() -> list[dict]:
+    """Load presets from presets.json. Returns empty list on any error."""
+    path = Path(PRESETS_FILE)
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text())
+        if not isinstance(data, list):
+            return []
+        return data
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def save_preset(name: str, ticker: str, custom_urls: list[str]) -> bool:
+    """Append a preset to presets.json. Returns False if name already exists."""
+    if not name.strip():
+        return False
+
+    presets = load_presets()
+    for p in presets:
+        if p.get("name", "").strip().upper() == name.strip().upper():
+            return False
+
+    presets.append({
+        "name": name.strip(),
+        "ticker": ticker.strip().upper(),
+        "custom_urls": custom_urls,
+    })
+    Path(PRESETS_FILE).write_text(json.dumps(presets, indent=2) + "\n")
+    return True
+
+
 st.set_page_config(page_title="Bull Run — Stock News Aggregator", layout="wide")
 
-st.title("🐂 Bull Run — Stock News Aggregator")
-
-# --- Stock Ticker Selector (main panel) ---
-ticker = st.text_input(
-    "Stock Ticker",
-    value="AAPL",
-    max_chars=5,
-    label_visibility="collapsed",
-).upper().strip()
-
-
-# --- Sidebar Configuration ---
-with st.sidebar:
-    st.header("LLM Settings")
-    llm_url = st.selectbox(
-        "LLM Base URL",
-        options=[
-            "http://localhost:8080/v1",
-            "http://localhost:8081/v1",
-        ],
-        help="OpenAI-compatible chat completions base URL (e.g., Ollama, LM Studio)",
-    )
-    model = st.selectbox(
-        "Model Name",
-        options=[
-            "Qwen3.6-27B-Q8_0.gguf",
-            "Qwen3.5-9B-Q8_0.gguf",
-        ],
-        help="Model name as configured on your LLM server",
-    )
-
-    st.divider()
-
-    st.header("Custom Sources")
-    custom_urls_text = st.text_area(
-        "Custom URLs (one per line)",
-        help="Explore custom pages for additional insights (max 20 pages)",
-        placeholder="https://example.com/news\nhttps://investor.example.com/earnings",
-    )
-
-
-# --- State Management ---
+# --- State Management (must be before any UI that references these keys) ---
 if "articles" not in st.session_state:
     st.session_state.articles = None
 if "summary" not in st.session_state:
@@ -70,6 +68,140 @@ if "progress_messages" not in st.session_state:
     st.session_state.progress_messages = []
 if "progress_done" not in st.session_state:
     st.session_state.progress_done = False
+if "preset_selector" not in st.session_state:
+    st.session_state.preset_selector = ""
+if "_preset_ticker" not in st.session_state:
+    st.session_state._preset_ticker = None
+if "_preset_urls_raw" not in st.session_state:
+    st.session_state._preset_urls_raw = None
+if "_last_ticker" not in st.session_state:
+    st.session_state._last_ticker = "AAPL"
+
+st.title("🐂 Bull Run — Stock News Aggregator")
+
+# --- Preset Selector Row ---
+_presets = load_presets()
+_preset_names = [p["name"] for p in _presets] if _presets else []
+
+
+def on_preset_change():
+    """Callback for preset selector — applies preset data and reruns to refresh widgets."""
+    _preset_name = st.session_state.get("preset_selector", "")
+    _presets_local = load_presets()
+    _preset_data = next((p for p in _presets_local if p["name"] == _preset_name), None)
+    if _preset_data:
+        st.session_state._preset_ticker = _preset_data["ticker"]
+        # Sync ticker input widget state so it updates when preset changes
+        st.session_state["ticker_input"] = _preset_data["ticker"]
+        # Keep _last_ticker in sync so text_input default is correct on reruns
+        st.session_state._last_ticker = _preset_data["ticker"]
+        _urls = _preset_data.get("custom_urls", [])
+        st.session_state._preset_urls_raw = _urls
+        # Force the text area to reflect this preset's URLs (overwrites stale widget state)
+        st.session_state["custom_urls_area"] = "\n".join(_urls) if _urls else ""
+    st.rerun()
+
+
+def on_preset_run():
+    """Callback for preset Run button — loads preset data then triggers news."""
+    _preset_name = st.session_state.get("preset_selector", "")
+    _presets_local = load_presets()
+    _preset_data = next((p for p in _presets_local if p["name"] == _preset_name), None)
+    if _preset_data:
+        st.session_state._preset_ticker = _preset_data["ticker"]
+        st.session_state._last_ticker = _preset_data["ticker"]
+        st.session_state._preset_urls_raw = _preset_data.get("custom_urls", [])
+    on_get_news()
+
+
+def on_preset_save():
+    """Callback for preset Save button — saves current ticker + sources as a preset."""
+    _name = st.session_state.get("_preset_name_input", "").strip()
+    if not _name:
+        st.error("Preset name is required")
+        return
+    _ticker_val = st.session_state.get("_current_ticker", ticker)
+    _urls_raw = [u.strip() for u in st.session_state.get("_current_urls", "").split("\n") if u.strip()]
+    ok = save_preset(_name, _ticker_val, _urls_raw)
+    if ok:
+        st.toast(f"Preset '{_name}' saved!")
+        st.rerun()
+    else:
+        st.error(f"Preset '{_name}' already exists — choose a different name")
+
+
+if _preset_names:
+    cols = st.columns([3, 0.8, 0.8, 0.2])
+    with cols[0]:
+        st.selectbox(
+            "Quick Presets",
+            options=_preset_names,
+            key="preset_selector",
+            help="Select a preset to load ticker + custom sources",
+            on_change=on_preset_change,
+        )
+    with cols[1]:
+        st.button("▶ Run", use_container_width=True, disabled=not st.session_state.preset_selector or st.session_state.progress_step is not None, help="Run news for selected preset", on_click=on_preset_run)
+    with cols[2]:
+        st.button("+ Save", use_container_width=True, help="Save current ticker + sources as a preset", on_click=on_preset_save)
+    with cols[3]:
+        st.empty()
+else:
+    st.info("No presets yet — save one below or create `presets.json`.")
+
+# --- Stock Ticker Selector (main panel) ---
+_ticker_default = st.session_state._preset_ticker if st.session_state._preset_ticker else st.session_state._last_ticker
+ticker = st.text_input(
+    "Stock Ticker",
+    value=_ticker_default,
+    max_chars=5,
+    label_visibility="collapsed",
+).upper().strip()
+st.session_state._last_ticker = ticker
+
+# Store current values for save preset callback
+st.session_state._current_ticker = ticker
+
+# --- Sidebar Configuration ---
+with st.sidebar:
+    st.header("LLM Settings")
+    llm_url = st.selectbox(
+        "LLM Base URL",
+        options=[
+            "http://localhost:8081/v1",
+            "http://localhost:8080/v1",
+        ],
+        help="OpenAI-compatible chat completions base URL (e.g., Ollama, LM Studio)",
+    )
+    model = st.selectbox(
+        "Model Name",
+        options=[
+            "Qwen3.5-9B-Q8_0.gguf",
+            "Qwen3.6-27B-Q8_0.gguf",
+        ],
+        help="Model name as configured on your LLM server",
+    )
+
+    st.divider()
+
+    st.header("Custom Sources")
+    _custom_default = "\n".join(st.session_state._preset_urls_raw) if st.session_state._preset_urls_raw else ""
+    custom_urls_text = st.text_area(
+        "Custom URLs (one per line)",
+        value=_custom_default,
+        help="Explore custom pages for additional insights (max 20 pages)",
+        placeholder="https://example.com/news\nhttps://investor.example.com/earnings",
+        key="custom_urls_area",
+    )
+
+    st.divider()
+    st.header("Save Preset")
+    _preset_name = st.text_input(
+        "Preset Name",
+        key="_preset_name_input",
+        help="Name for this preset (e.g., 'Apple', 'Tesla')",
+    )
+    st.session_state._current_urls = custom_urls_text
 
 
 def on_get_news():
@@ -85,7 +217,15 @@ def on_get_news():
     st.session_state.progress_step = 1
     st.session_state.progress_messages = []
     st.session_state.progress_done = False
-    st.session_state._custom_urls = [u.strip() for u in custom_urls_text.split("\n") if u.strip()] if custom_urls_text.strip() else []
+    # Use preset URLs if set, otherwise parse from text area
+    if st.session_state.get("_preset_urls_raw"):
+        st.session_state._custom_urls = st.session_state._preset_urls_raw
+    else:
+        _urls_text = st.session_state.get("_current_urls", "")
+        st.session_state._custom_urls = [u.strip() for u in _urls_text.split("\n") if u.strip()] if _urls_text.strip() else []
+    # Clear preset override after use so ticker input isn't locked
+    st.session_state._preset_ticker = None
+    st.session_state._preset_urls_raw = None
     st.rerun()
 
 

@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch, mock_open
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from chat import _web_search
+from chat import _build_system_prompt, _web_search
 
 
 def test_web_search_returns_formatted_results():
@@ -85,3 +85,32 @@ def test_web_search_truncates_long_content():
 
     assert "xxx..." in result
     assert "x" * 350 not in result
+
+
+def test_build_system_prompt_followup_mode():
+    """Verify system prompt includes articles and summary in follow-up mode."""
+    from chat import _build_system_prompt
+
+    articles = [
+        {"title": "AAPL Earnings Beat", "source": "Reuters", "date": "2026-07-01", "snippet": "Strong Q2 results."},
+    ]
+    summary = "Apple shows strong earnings."
+
+    prompt = _build_system_prompt("AAPL", articles, summary)
+
+    assert "AAPL" in prompt
+    assert "Apple shows strong earnings" in prompt
+    assert "AAPL Earnings Beat" in prompt
+    assert "web_search" in prompt
+
+
+def test_build_system_prompt_standalone_mode():
+    """Verify system prompt omits article context in standalone mode."""
+    from chat import _build_system_prompt
+
+    prompt = _build_system_prompt("TSLA", None, None)
+
+    assert "TSLA" in prompt
+    assert "INITIAL SUMMARY" not in prompt
+    assert "ARTICLES" not in prompt
+    assert "web_search" in prompt

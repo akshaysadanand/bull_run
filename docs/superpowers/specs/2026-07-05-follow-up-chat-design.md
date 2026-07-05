@@ -2,7 +2,12 @@
 
 ## Overview
 
-Add a multi-turn chat interface below the summaries section where users can ask follow-up questions about the scraped news. The LLM answers using the original articles, the initial summary, and conversation history — with the ability to search the web via MCP for additional context.
+Add a multi-turn chat interface that works in two modes:
+
+1. **Follow-up mode** — After running "Get News", the chat has access to scraped articles and the initial summary as context, plus web search for additional information.
+2. **Standalone mode** — Without running "Get News", the chat works with just a ticker. The LLM relies on web search to find and answer questions about the stock.
+
+The chat section is always visible (not gated behind summaries). The system prompt adapts based on what context is available.
 
 ## Architecture
 
@@ -25,23 +30,26 @@ Streamlit UI (app.py)
 ```python
 def ask_followup(
     question: str,
-    articles: list[dict],      # scraped articles (Yahoo + custom)
-    summary: str,              # initial summary from summarizer.py
+    ticker: str,
     history: list[dict],       # prior chat messages [{role, content}, ...]
     llm_url: str,
     model: str,
+    articles: list[dict] | None = None,   # optional: scraped articles
+    summary: str | None = None,           # optional: initial summary
 ) -> dict:
     # Returns {"answer": str, "history": list[dict]}
 ```
 
 **Internal flow:**
-1. Build system prompt with role ("financial analyst"), the ticker, the initial summary as reference, and all article titles + snippets
+1. Build system prompt — if articles/summary provided, include them as context; otherwise use standalone prompt with just the ticker
 2. Append user's question to message history
 3. Call LLM with `tools=[web_search_tool_definition]`
 4. If LLM returns a tool call → execute web search via SearXNG MCP, inject result as `tool` role message, loop back to step 3 (max 3 search iterations)
 5. If LLM returns text → append to history, return answer + updated history
 
-**System prompt for chat:**
+**System prompt adapts based on available context:**
+
+*With articles + summary (follow-up mode):*
 ```
 You are a financial news analyst helping a user understand news about {TICKER}.
 You have access to the following context:
@@ -53,6 +61,12 @@ ARTICLES:
 {articles_text}
 
 Answer the user's question based on this context. If you need additional current information, use the web_search tool. Be concise and cite sources when referencing specific claims.
+```
+
+*Without articles (standalone mode):*
+```
+You are a financial news analyst helping a user research {TICKER}.
+Use the web_search tool to find current information. Be concise and cite sources when referencing specific claims.
 ```
 
 ### Web search tool definition
@@ -80,15 +94,16 @@ The tool implementation calls the SearXNG MCP (`mcp_web-search-mc_searxng_search
 
 ### `app.py` changes
 
-Below the summaries section, add:
-- **Chat header** — "💬 Ask a follow-up question" (only visible after summaries are ready)
+Below the main panel (visible regardless of whether summaries exist), add:
+- **Chat header** — "💬 Ask about {TICKER}" (shows context mode: "with scraped articles" or "web search only")
 - **Message list** — renders chat history from `st.session_state.chat_history` as alternating user/assistant messages
 - **Text input** — single-line input at the bottom; sends to `ask_followup()` on Enter or button click
 - **Loading state** — spinner while LLM is thinking/searching
 
 **Session state additions:**
-- `chat_history` — list of `{role, content}` dicts; reset on new "Get News" run
+- `chat_history` — list of `{role, content}` dicts; reset on new "Get News" run OR when ticker changes
 - `chat_thinking` — optional chain-of-thought from follow-up responses (collapsible expander)
+- `chat_context_mode` — string: "follow-up" (articles available) or "standalone" (web search only); set automatically based on whether articles exist
 
 ### Context injection strategy
 
@@ -104,7 +119,7 @@ This gives the LLM enough to answer targeted questions without re-summarizing ev
 ```
 User types question → app.py
     ↓
-app.py calls chat.ask_followup(question, articles, summary, history, llm_url, model)
+app.py calls chat.ask_followup(question, ticker, history, llm_url, model, articles=articles, summary=summary)
     ↓
 chat.py builds system prompt + message list → OpenAI client call with tools=
     ↓ (if tool call)
@@ -123,11 +138,11 @@ app.py renders answer in chat UI, updates session_state.chat_history
 
 | Scenario | Behavior |
 |---|---|
-| LLM doesn't support tool calling | Catch `BadRequestError`/`NotFoundError` on first call, fall back to text-only response with note: "Web search unavailable — response based on scraped articles only" |
+| LLM doesn't support tool calling | Catch `BadRequestError`/`NotFoundError` on first call, fall back to text-only response with note: "Web search unavailable — response based on available context only" |
 | Web search times out or fails | Inject error message as tool result ("Search failed: timeout"), let LLM decide how to proceed |
-| Context window exceeded (long conversations) | Trim oldest assistant messages first, keep system prompt + last N turns; show warning if trimming aggressively |
+| Context window exceeded (long conversations) | Trim oldest assistant messages first, keep system prompt + last 10 turns; show warning if trimming more than 5 turns |
 | User sends empty question | Send button disabled for empty input |
-| No articles/summary yet (user tries to chat before running Get News) | Chat section hidden until summaries are ready |
+| No ticker entered | Show placeholder "Enter a ticker to start chatting" |
 
 ## Testing
 
@@ -138,6 +153,8 @@ app.py renders answer in chat UI, updates session_state.chat_history
 - Tool call limit (3 iterations) → verify loop terminates gracefully
 - Empty question → verify rejected early without LLM call
 - LLM raises error on tool call → verify graceful fallback to text-only
+- Standalone mode (no articles/summary) → verify system prompt omits article context
+- Follow-up mode (with articles/summary) → verify system prompt includes article context
 
 **`test_summarizer.py`** — unchanged (existing tests still valid)
 **`test_scraper.py`** — unchanged

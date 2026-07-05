@@ -2,7 +2,6 @@
 
 import json
 import logging
-from typing import Optional
 from urllib.parse import quote_plus
 from urllib.request import urlopen
 
@@ -45,7 +44,10 @@ def _web_search(query: str) -> str:
         if url:
             lines.append(f"    URL: {url}")
         if content:
-            lines.append(f"    {content[:300]}")
+            snippet = content[:300]
+            if len(content) > 300:
+                snippet += "..."
+            lines.append(f"    {snippet}")
         lines.append("")
 
     return "\n".join(lines)

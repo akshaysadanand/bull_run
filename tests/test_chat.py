@@ -114,3 +114,37 @@ def test_build_system_prompt_standalone_mode():
     assert "INITIAL SUMMARY" not in prompt
     assert "ARTICLES" not in prompt
     assert "web_search" in prompt
+
+
+def test_ask_followup_returns_text_response():
+    """Verify ask_followup returns LLM text response and updated history."""
+    from chat import ask_followup
+
+    mock_response = MagicMock()
+    mock_response.choices[0].message.content = "Based on the articles, AAPL shows strong earnings growth."
+    mock_response.choices[0].message.tool_calls = None
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.return_value = mock_response
+
+    with patch("chat.OpenAI", return_value=mock_client) as mock_openai:
+        result = ask_followup(
+            question="How are AAPL earnings?",
+            ticker="AAPL",
+            history=[],
+            llm_url="http://localhost:8080/v1",
+            model="qwen",
+            articles=[{"title": "Earnings Beat", "source": "Reuters", "date": "2026-07-01", "snippet": "Strong results."}],
+            summary="AAPL shows strong earnings.",
+        )
+
+    assert "earnings growth" in result["answer"]
+    assert len(result["history"]) == 2  # user + assistant
+    assert result["history"][0]["role"] == "user"
+    assert result["history"][1]["role"] == "assistant"
+
+    # Verify LLM was called with tools parameter
+    call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+    assert "tools" in call_kwargs
+    assert len(call_kwargs["tools"]) == 1
+    assert call_kwargs["tools"][0]["function"]["name"] == "web_search"

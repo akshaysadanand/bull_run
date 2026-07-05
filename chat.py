@@ -6,11 +6,31 @@ from typing import Optional
 from urllib.parse import quote_plus
 from urllib.request import urlopen
 
+from openai import OpenAI
+
 logger = logging.getLogger(__name__)
 
 SEARXNG_URL = "http://localhost:8088"
 MAX_SEARCH_ITERATIONS = 3
 MAX_CHAT_TURNS = 10
+
+WEB_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": "Search the web for current information about a topic",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query"
+                }
+            },
+            "required": ["query"]
+        }
+    }
+}
 
 
 def _build_system_prompt(
@@ -89,3 +109,111 @@ def _web_search(query: str) -> str:
         lines.append("")
 
     return "\n".join(lines)
+
+
+def ask_followup(
+    question: str,
+    ticker: str,
+    history: list[dict],
+    llm_url: str,
+    model: str,
+    articles: Optional[list[dict]] = None,
+    summary: Optional[str] = None,
+) -> dict:
+    """Process a follow-up question with multi-turn chat and web search tool calling.
+
+    Args:
+        question: User's question.
+        ticker: Stock ticker symbol.
+        history: Prior chat messages [{role, content}, ...].
+        llm_url: OpenAI-compatible LLM base URL.
+        model: Model name.
+        articles: Optional scraped articles for context.
+        summary: Optional initial summary for context.
+
+    Returns:
+        Dict with 'answer' (LLM response text) and 'history' (updated message list).
+    """
+    if not question.strip():
+        return {"answer": "", "history": history}
+
+    client = OpenAI(base_url=llm_url, api_key="not-needed")
+
+    system_prompt = _build_system_prompt(ticker, articles, summary)
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+    ]
+
+    # Trim history to last MAX_CHAT_TURNS turns if needed
+    trimmed_history = history[-(MAX_CHAT_TURNS * 2):] if len(history) > MAX_CHAT_TURNS * 2 else history
+    messages.extend(trimmed_history)
+    messages.append({"role": "user", "content": question})
+
+    # Tool-calling loop (max MAX_SEARCH_ITERATIONS iterations)
+    for _ in range(MAX_SEARCH_ITERATIONS):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=[WEB_SEARCH_TOOL],
+                temperature=0.1,
+            )
+        except Exception as e:
+            logger.exception("LLM call failed, falling back to text-only")
+            # Retry without tools
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=0.1,
+                )
+            except Exception as e2:
+                return {"answer": f"LLM error: {e2}", "history": history}
+
+        message = response.choices[0].message
+
+        if message.tool_calls:
+            # Execute tool calls and append results
+            for tool_call in message.tool_calls:
+                if tool_call.function.name == "web_search":
+                    args = json.loads(tool_call.function.arguments)
+                    query = args.get("query", "")
+                    search_result = _web_search(query)
+
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": search_result,
+                    })
+
+            # Also append the assistant's tool call message
+            messages.append({
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": tc.type,
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        }
+                    }
+                    for tc in message.tool_calls
+                ],
+            })
+            continue  # Loop back to call LLM again with tool results
+
+        # Text response — done
+        answer = message.content or ""
+        new_history = trimmed_history + [
+            {"role": "user", "content": question},
+            {"role": "assistant", "content": answer},
+        ]
+        return {"answer": answer, "history": new_history}
+
+    # Exceeded max iterations
+    return {
+        "answer": "I've reached my search limit. Based on what I found, let me provide my best answer with the information available.",
+        "history": history,
+    }

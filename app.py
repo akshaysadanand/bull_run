@@ -498,27 +498,80 @@ if ticker:
                     status.markdown(f"**{i}. web_search** — `{tc.get('query', '')}`")
             st.session_state.chat_tool_calls = result["tool_calls"]
 
-        # Stream raw response, then clean thinking tags after streaming completes
+        # Stream response, separating thinking tags from answer in real-time
         with st.container():
             st.markdown("**Assistant:**")
-            full_raw = st.write_stream(result["stream"])
 
-        # Extract thinking blocks from raw response
-        thinking_parts = re.findall(r'<think>(.*?)</think>', full_raw, flags=re.DOTALL | re.IGNORECASE)
-        thinking_parts += re.findall(r'<thinking>(.*?)</thinking>', full_raw, flags=re.DOTALL | re.IGNORECASE)
-        thinking_parts += re.findall(r'<think>(.*?)$', full_raw, flags=re.DOTALL | re.IGNORECASE)
-        thinking = "\n".join(p.strip() for p in thinking_parts if p.strip())
+        # Placeholders for real-time updates
+        thinking_placeholder = st.empty()
+        answer_placeholder = st.empty()
 
-        # Strip thinking tags from the full response (after streaming, not per-chunk)
+        # Accumulate raw text, tracking thinking vs answer
+        full_raw = ""
+        in_thinking = False
+        thinking_buffer = ""
+        answer_text = ""
+        thinking_tag_pattern = re.compile(
+            r'(</?thinking>|<think>|</think>)', re.IGNORECASE
+        )
+
+        for chunk in result["stream"]:
+            full_raw += chunk
+
+            # Find thinking tag boundaries in the new chunk portion
+            pos = 0
+            for match in thinking_tag_pattern.finditer(chunk):
+                tag = match.group(0)
+                before = chunk[pos:match.start()]
+
+                if in_thinking:
+                    thinking_buffer += before
+                else:
+                    answer_text += before
+
+                # Check what tag we hit
+                if re.match(r'</?thinking>', tag, re.IGNORECASE):
+                    if re.match(r'</', tag):
+                        in_thinking = False
+                    else:
+                        in_thinking = True
+                elif tag == '</think>':
+                    in_thinking = False
+                elif tag == '</think>':
+                    in_thinking = True
+
+                pos = match.end()
+
+            # Remaining text after last tag
+            remaining = chunk[pos:]
+            if in_thinking:
+                thinking_buffer += remaining
+            else:
+                answer_text += remaining
+
+            # Update UI in real-time
+            if thinking_buffer.strip():
+                with thinking_placeholder.container():
+                    with st.expander("🧠 Model's Reasoning Process", expanded=True):
+                        st.markdown(thinking_buffer.strip())
+            if answer_text.strip():
+                answer_placeholder.markdown(answer_text.strip())
+
+        # Final cleanup — strip any unclosed thinking tags
         full_answer = re.sub(r'<think>.*?</think>', '', full_raw, flags=re.DOTALL | re.IGNORECASE)
         full_answer = re.sub(r'<thinking>.*?</thinking>', '', full_answer, flags=re.DOTALL | re.IGNORECASE)
         full_answer = re.sub(r'\s*<think>.*$', '', full_answer, flags=re.DOTALL | re.IGNORECASE)
         full_answer = full_answer.strip()
 
-        # Show thinking in dropdown if available
+        # Final render of thinking (collapsed) and clean answer
+        thinking = thinking_buffer.strip()
         if thinking:
-            with st.expander("🧠 Model's Reasoning Process"):
-                st.markdown(thinking)
+            with thinking_placeholder.container():
+                with st.expander("🧠 Model's Reasoning Process"):
+                    st.markdown(thinking)
+        else:
+            thinking_placeholder.empty()
+        answer_placeholder.markdown(full_answer)
 
         # Save to history after streaming completes (clean text only)
         st.session_state.chat_history = pending["history"] + [

@@ -1,5 +1,6 @@
 """Streamlit UI for the stock news aggregator."""
 
+import html
 import json
 from pathlib import Path
 
@@ -493,9 +494,18 @@ if ticker:
 
         # Show tool call progress
         if result["tool_calls"]:
-            with st.status("🔍 Searching...", expanded=False) as status:
+            with st.status("🔍 Researching...", expanded=False) as status:
                 for i, tc in enumerate(result["tool_calls"], 1):
-                    status.markdown(f"**{i}. web_search** — `{tc.get('query', '')}`")
+                    tool = tc.get("tool", "unknown")
+                    if tool == "searxng_search":
+                        status.markdown(f"**{i}. 🔎 web_search** — `{tc.get('query', '')}`")
+                    elif tool == "web_scrape":
+                        url = tc.get("url", "")
+                        # Shorten long URLs for display
+                        display_url = url[:80] + "..." if len(url) > 80 else url
+                        status.markdown(f"**{i}. 📄 web_scrape** — `{display_url}`")
+                    else:
+                        status.markdown(f"**{i}. {tool}**")
             st.session_state.chat_tool_calls = result["tool_calls"]
 
         # Stream response, separating thinking tags from answer in real-time
@@ -515,47 +525,62 @@ if ticker:
             r'(</?thinking>|<think>|</think>)', re.IGNORECASE
         )
 
-        for chunk in result["stream"]:
-            full_raw += chunk
+        stream_error = None
+        try:
+            for chunk in result["stream"]:
+                full_raw += chunk
 
-            # Find thinking tag boundaries in the new chunk portion
-            pos = 0
-            for match in thinking_tag_pattern.finditer(chunk):
-                tag = match.group(0)
-                before = chunk[pos:match.start()]
+                # Find thinking tag boundaries in the new chunk portion
+                pos = 0
+                for match in thinking_tag_pattern.finditer(chunk):
+                    tag = match.group(0)
+                    before = chunk[pos:match.start()]
 
-                if in_thinking:
-                    thinking_buffer += before
-                else:
-                    answer_text += before
-
-                # Check what tag we hit
-                if re.match(r'</?thinking>', tag, re.IGNORECASE):
-                    if re.match(r'</', tag):
-                        in_thinking = False
+                    if in_thinking:
+                        thinking_buffer += before
                     else:
+                        answer_text += before
+
+                    # Check what tag we hit
+                    if re.match(r'</?thinking>', tag, re.IGNORECASE):
+                        if re.match(r'</', tag):
+                            in_thinking = False
+                        else:
+                            in_thinking = True
+                    elif tag == '</think>':
+                        in_thinking = False
+                    elif tag == '</think>':
                         in_thinking = True
-                elif tag == '</think>':
-                    in_thinking = False
-                elif tag == '</think>':
-                    in_thinking = True
 
-                pos = match.end()
+                    pos = match.end()
 
-            # Remaining text after last tag
-            remaining = chunk[pos:]
-            if in_thinking:
-                thinking_buffer += remaining
-            else:
-                answer_text += remaining
+                # Remaining text after last tag
+                remaining = chunk[pos:]
+                if in_thinking:
+                    thinking_buffer += remaining
+                else:
+                    answer_text += remaining
 
-            # Update UI in real-time
-            if thinking_buffer.strip():
-                with thinking_placeholder.container():
-                    with st.expander("🧠 Model's Reasoning Process", expanded=True):
-                        st.markdown(thinking_buffer.strip())
-            if answer_text.strip():
-                answer_placeholder.markdown(answer_text.strip())
+                # Update UI in real-time using plain text to avoid broken markdown
+                # Markdown will be rendered properly on the final pass below
+                display_parts = []
+                if thinking_buffer.strip():
+                    display_parts.append(f"_🧠 Thinking..._")
+                if answer_text.strip():
+                    display_parts.append(answer_text.strip())
+                if display_parts:
+                    # Use plain text display during streaming — markdown breaks
+                    # when bold/italic markers are split across word boundaries
+                    answer_placeholder.markdown(
+                        f"<pre style='white-space:pre-wrap;font-family:inherit'>"
+                        + html.escape(" ".join(display_parts))
+                        + "</pre>"
+                    )
+        except Exception as e:
+            import logging
+            stream_logger = logging.getLogger(__name__)
+            stream_logger.exception("Streaming failed mid-response")
+            stream_error = str(e)
 
         # Final cleanup — strip any unclosed thinking tags
         full_answer = re.sub(r'<think>.*?</think>', '', full_raw, flags=re.DOTALL | re.IGNORECASE)
@@ -571,7 +596,16 @@ if ticker:
                     st.markdown(thinking)
         else:
             thinking_placeholder.empty()
-        answer_placeholder.markdown(full_answer)
+
+        # Clear streaming placeholder then render final answer as proper markdown
+        answer_placeholder.empty()
+        if full_answer:
+            with st.container():
+                st.markdown(full_answer)
+
+        # Show warning if streaming was interrupted (partial response)
+        if stream_error:
+            st.warning(f"⚠️ Streaming was interrupted ({stream_error}). Showing partial response.")
 
         # Save to history after streaming completes (clean text only)
         st.session_state.chat_history = pending["history"] + [

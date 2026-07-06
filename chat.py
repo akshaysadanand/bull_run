@@ -373,41 +373,26 @@ def ask_followup_stream(
             ask_followup_stream._tool_calls.extend(tool_call_info)
             continue
 
-        # Text response (no tool calls) — stream a new call with same messages
-        break  # Exit loop, fall through to streaming final call
-
-    # Stream final LLM call — try streaming, fall back to non-streaming if server doesn't support it
-    def final_stream():
+        # Text response (no tool calls) — get final answer
         try:
-            stream = client.chat.completions.create(
+            response = client.chat.completions.create(
                 model=model,
                 messages=messages,
                 temperature=0.1,
-                stream=True,
             )
-            for chunk in stream:
-                delta = chunk.choices[0].delta.content
-                if delta:
-                    yield delta
+            content = response.choices[0].message.content or ""
         except Exception as e:
-            logger.warning("Streaming not supported, falling back to non-streaming: %s", e)
-            # Fall back to non-streaming call
-            try:
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=0.1,
-                )
-                content = response.choices[0].message.content or ""
-                # Yield in word-sized chunks to simulate streaming
-                for word in content.split():
-                    yield word + " "
-            except Exception as e2:
-                logger.exception("Both streaming and non-streaming failed")
-                yield f"LLM error: {e2}"
+            logger.exception("LLM call failed")
+            content = f"LLM error: {e}"
+
+    def final_stream():
+        # Yield in word-sized chunks for simulated streaming
+        for word in content.split():
+            yield word + " "
 
     return {
         "stream": final_stream(),
         "tool_calls": ask_followup_stream._tool_calls,
         "error": None,
+        "full_text": content,
     }

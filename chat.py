@@ -35,6 +35,7 @@ def _strip_tool_call_xml(text: str) -> str:
 MCP_SERVER_DIR = Path.home() / "Projects" / "web-search-MCP"
 MAX_SEARCH_ITERATIONS = 3
 MAX_CHAT_TURNS = 10
+MAX_RESPONSE_TOKENS = 4096
 
 # LLM tool definitions - names match the MCP server's tool names
 WEB_SEARCH_TOOL = {
@@ -329,6 +330,7 @@ def ask_followup(
                 messages=messages,
                 tools=TOOLS,
                 temperature=0.1,
+                max_tokens=MAX_RESPONSE_TOKENS,
             )
         except Exception as e:
             logger.exception("LLM call failed, falling back to text-only")
@@ -338,6 +340,7 @@ def ask_followup(
                     model=model,
                     messages=messages,
                     temperature=0.1,
+                    max_tokens=MAX_RESPONSE_TOKENS,
                 )
             except Exception as e2:
                 error_answer = f"LLM error: {e2}"
@@ -421,6 +424,7 @@ def ask_followup(
             model=model,
             messages=messages,
             temperature=0.1,
+            max_tokens=MAX_RESPONSE_TOKENS,
         )
         answer = final_response.choices[0].message.content or "Search limit reached."
     except Exception:
@@ -497,6 +501,7 @@ def ask_followup_stream(
                 messages=messages,
                 tools=TOOLS,
                 temperature=0.1,
+                max_tokens=MAX_RESPONSE_TOKENS,
             )
         except Exception as e:
             logger.exception("LLM call failed, falling back to text-only")
@@ -505,6 +510,7 @@ def ask_followup_stream(
                     model=model,
                     messages=messages,
                     temperature=0.1,
+                    max_tokens=MAX_RESPONSE_TOKENS,
                 )
             except Exception as e2:
                 error_msg = str(e2)
@@ -561,39 +567,101 @@ def ask_followup_stream(
             ask_followup_stream._tool_calls.extend(tool_call_info)
             continue
 
-        # Text response (no tool calls) - get final answer
+        # Text response (no tool calls) — stream the final answer
+        def _strip_streaming_tool_calls(text: str) -> str:
+            """Strip raw tool call XML artifacts from streaming chunks.
+
+            Some LLMs emit <tool_call>function=...</tool_call> in the content field alongside
+            structured tool_calls.  Because we're inside a generator (can't
+            accumulate the full buffer), we strip incrementally — any partial
+            tag that hasn't been closed yet is withheld until it either
+            completes (then dropped) or is followed by real text.
+            """
+            # Simple approach: strip complete tags, then strip unclosed starters
+            text = re.sub(r'\u2458\s*<function=[^>]*>.*?</function>\s*\u2459', '', text, flags=re.DOTALL)
+            text = re.sub(r'\u2458\s*<function=[^>]*>.*$', '', text, flags=re.DOTALL | re.MULTILINE)
+            return text
+
+        def final_stream():
+            """Stream the final LLM response token-by-token.
+
+            Tries real streaming first. Falls back to non-streaming + word
+            chunking if the LLM endpoint doesn't support streaming or if
+            the connection is interrupted mid-stream.
+            """
+            try:
+                stream = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=0.1,
+                    max_tokens=MAX_RESPONSE_TOKENS,
+                    stream=True,
+                )
+                for chunk in stream:
+                    delta = chunk.choices[0].delta if chunk.choices else None
+                    if delta and delta.content:
+                        cleaned = _strip_streaming_tool_calls(delta.content)
+                        if cleaned:
+                            yield cleaned
+            except Exception as e:
+                logger.warning("Streaming failed (%s), falling back to non-streaming", e)
+                # Fallback: get the full response and yield word-by-word
+                try:
+                    response = client.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        temperature=0.1,
+                        max_tokens=MAX_RESPONSE_TOKENS,
+                    )
+                    content = _strip_tool_call_xml(response.choices[0].message.content or "")
+                    for word in content.split():
+                        yield word + " "
+                except Exception as e2:
+                    logger.exception("Fallback non-streaming call also failed")
+                    yield f"LLM error: {e2}"
+
+        return {
+            "stream": final_stream(),
+            "tool_calls": ask_followup_stream._tool_calls,
+            "error": None,
+        }
+
+    # Loop exhausted without a text response — make a final call without tools
+    # and stream that as well
+    def final_fallback_stream():
+        """Stream a final LLM call after tool-calling loop was exhausted."""
         try:
-            response = client.chat.completions.create(
+            stream = client.chat.completions.create(
                 model=model,
                 messages=messages,
                 temperature=0.1,
+                max_tokens=MAX_RESPONSE_TOKENS,
+                stream=True,
             )
-            content = response.choices[0].message.content or ""
+            for chunk in stream:
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if delta and delta.content:
+                    cleaned = _strip_tool_call_xml(delta.content)
+                    if cleaned:
+                        yield cleaned
         except Exception as e:
-            logger.exception("LLM call failed")
-            content = f"LLM error: {e}"
-
-    # If loop exhausted without text response, make a final call without tools
-    if not content:
-        try:
-            final_response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=0.1,
-            )
-            content = final_response.choices[0].message.content or "Search limit reached."
-        except Exception as e:
-            logger.exception("Final LLM call failed")
-            content = f"Search limit reached. LLM error: {e}"
-
-    def final_stream():
-        # Yield in word-sized chunks for simulated streaming
-        for word in content.split():
-            yield word + " "
+            logger.warning("Final streaming call failed (%s), falling back to non-streaming", e)
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=0.1,
+                    max_tokens=MAX_RESPONSE_TOKENS,
+                )
+                content = _strip_tool_call_xml(response.choices[0].message.content or "Search limit reached.")
+                for word in content.split():
+                    yield word + " "
+            except Exception as e2:
+                logger.exception("Final fallback non-streaming call failed")
+                yield f"Search limit reached. LLM error: {e2}"
 
     return {
-        "stream": final_stream(),
+        "stream": final_fallback_stream(),
         "tool_calls": ask_followup_stream._tool_calls,
         "error": None,
-        "full_text": content,
     }

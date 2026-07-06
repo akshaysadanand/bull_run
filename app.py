@@ -503,6 +503,12 @@ if ticker:
             st.markdown("**Assistant:**")
             full_raw = st.write_stream(result["stream"])
 
+        # Extract thinking blocks from raw response
+        thinking_parts = re.findall(r'<think>(.*?)</think>', full_raw, flags=re.DOTALL | re.IGNORECASE)
+        thinking_parts += re.findall(r'<thinking>(.*?)</thinking>', full_raw, flags=re.DOTALL | re.IGNORECASE)
+        thinking_parts += re.findall(r'<think>(.*?)$', full_raw, flags=re.DOTALL | re.IGNORECASE)
+        thinking = "\n".join(p.strip() for p in thinking_parts if p.strip())
+
         # Strip thinking tags from the full response (after streaming, not per-chunk)
         full_answer = re.sub(r'<think>.*?</think>', '', full_raw, flags=re.DOTALL | re.IGNORECASE)
         full_answer = re.sub(r'<thinking>.*?</thinking>', '', full_answer, flags=re.DOTALL | re.IGNORECASE)
@@ -510,7 +516,6 @@ if ticker:
         full_answer = full_answer.strip()
 
         # Show thinking in dropdown if available
-        thinking = getattr(ask_followup_stream, "_thinking", "")
         if thinking:
             with st.expander("🧠 Model's Reasoning Process"):
                 st.markdown(thinking)

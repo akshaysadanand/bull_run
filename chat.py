@@ -86,15 +86,19 @@ class _MCPClient:
     Starts the MCP server subprocess once in a background thread and keeps
     the session alive for the lifetime of the application. Tool calls are
     queued into the persistent event loop via asyncio.run_coroutine_threadsafe.
+
+    Uses a dict sentinel (_state) instead of _instance to survive Streamlit's
+    module re-execution — the class object persists in sys.modules so the
+    dict reference is stable across reruns.
     """
 
-    _instance = None
+    _state = {"_instance": None}
 
     @classmethod
     def get(cls) -> "_MCPClient":
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
+        if cls._state["_instance"] is None:
+            cls._state["_instance"] = cls()
+        return cls._state["_instance"]
 
     def __init__(self):
         self._loop = None
@@ -145,8 +149,12 @@ class _MCPClient:
 
     @property
     def is_available(self) -> bool:
-        """Check if the MCP server is available and ready."""
-        return self._session is not None and self._loop is not None
+        """Check if the MCP server session is alive and responsive."""
+        if self._session is None or self._loop is None:
+            return False
+        if self._thread is not None and not self._thread.is_alive():
+            return False
+        return True
 
     def call_tool(self, tool_name: str, arguments: dict) -> str:
         """Call an MCP tool synchronously using the persistent session.

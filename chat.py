@@ -169,7 +169,12 @@ def ask_followup(
                     temperature=0.1,
                 )
             except Exception as e2:
-                return {"answer": f"LLM error: {e2}", "history": history}
+                error_answer = f"LLM error: {e2}"
+                new_history = trimmed_history + [
+                    {"role": "user", "content": question},
+                    {"role": "assistant", "content": error_answer},
+                ]
+                return {"answer": error_answer, "history": new_history}
 
         message = response.choices[0].message
 
@@ -213,7 +218,9 @@ def ask_followup(
         return {"answer": answer, "history": new_history}
 
     # Exceeded max iterations
-    return {
-        "answer": "I've reached my search limit. Based on what I found, let me provide my best answer with the information available.",
-        "history": history,
-    }
+    answer = "I've reached my search limit. Based on what I found, let me provide my best answer with the information available."
+    new_history = trimmed_history + [
+        {"role": "user", "content": question},
+        {"role": "assistant", "content": answer},
+    ]
+    return {"answer": answer, "history": new_history}

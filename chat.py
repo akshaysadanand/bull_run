@@ -32,7 +32,7 @@ def _strip_tool_call_xml(text: str) -> str:
     text = re.sub(r'\u2458\s*<function=[^>]*>.*$', '', text, flags=re.DOTALL | re.MULTILINE)
     return text.strip()
 
-MCP_SERVER_SCRIPT = Path.home() / "Projects" / "web-search-MCP" / "start.sh"
+MCP_SERVER_DIR = Path.home() / "Projects" / "web-search-MCP"
 MAX_SEARCH_ITERATIONS = 3
 MAX_CHAT_TURNS = 10
 
@@ -121,8 +121,8 @@ class _MCPClient:
 
             try:
                 server_params = StdioServerParameters(
-                    command="bash",
-                    args=[str(MCP_SERVER_SCRIPT)],
+                    command="uv",
+                    args=["--directory", str(MCP_SERVER_DIR), "run", "web-search-mcp"],
                 )
 
                 async def _init():

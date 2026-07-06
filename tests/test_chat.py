@@ -148,3 +148,41 @@ def test_ask_followup_returns_text_response():
     assert "tools" in call_kwargs
     assert len(call_kwargs["tools"]) == 1
     assert call_kwargs["tools"][0]["function"]["name"] == "web_search"
+
+
+def test_ask_followup_executes_tool_calls():
+    """Verify ask_followup executes web_search tool calls and loops back."""
+    from chat import ask_followup
+
+    # First call: LLM requests web search
+    mock_tool_call = MagicMock()
+    mock_tool_call.id = "call_123"
+    mock_tool_call.type = "function"
+    mock_tool_call.function.name = "web_search"
+    mock_tool_call.function.arguments = '{"query": "AAPL latest news"}'
+
+    mock_response_tool = MagicMock()
+    mock_response_tool.choices[0].message.content = None
+    mock_response_tool.choices[0].message.tool_calls = [mock_tool_call]
+
+    # Second call: LLM returns text answer after seeing search results
+    mock_response_text = MagicMock()
+    mock_response_text.choices[0].message.content = "Based on recent news, AAPL announced new products."
+    mock_response_text.choices[0].message.tool_calls = None
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.side_effect = [mock_response_tool, mock_response_text]
+
+    with patch("chat.OpenAI", return_value=mock_client):
+        with patch("chat._web_search", return_value="[1] AAPL New Product Launch\n    URL: https://example.com\n    Apple announces new lineup."):
+            result = ask_followup(
+                question="What's new with AAPL?",
+                ticker="AAPL",
+                history=[],
+                llm_url="http://localhost:8080/v1",
+                model="qwen",
+            )
+
+    # Verify LLM was called twice (tool call + final answer)
+    assert mock_client.chat.completions.create.call_count == 2
+    assert "new products" in result["answer"]

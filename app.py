@@ -78,6 +78,8 @@ if "_last_ticker" not in st.session_state:
     st.session_state._last_ticker = "AAPL"
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
+if "chat_tool_calls" not in st.session_state:
+    st.session_state.chat_tool_calls = []
 
 st.title("🐂 Bull Run — Stock News Aggregator")
 
@@ -217,6 +219,7 @@ def on_get_news():
     st.session_state.custom_thinking = None
     st.session_state.custom_summary_error = None
     st.session_state.chat_history = []
+    st.session_state.chat_tool_calls = []
     st.session_state.progress_step = 1
     st.session_state.progress_messages = []
     st.session_state.progress_done = False
@@ -320,7 +323,7 @@ def _render_summary(summary, summary_error, thinking, llm_url, model):
 
 
 def on_chat_send():
-    """Callback for chat send button — processes question and updates history."""
+    """Callback for chat send (triggered by Enter key) — processes question and updates history."""
     question = st.session_state.get("chat_input", "").strip()
     if not question:
         return
@@ -349,6 +352,7 @@ def on_chat_send():
 
     if result["answer"]:
         st.session_state.chat_history = result["history"]
+        st.session_state.chat_tool_calls = result.get("tool_calls", [])
         st.session_state.chat_input = ""
         st.rerun()
 
@@ -468,17 +472,24 @@ if ticker:
         elif msg["role"] == "assistant":
             st.markdown(f"**Assistant:** {msg['content']}")
 
-    # Chat input
-    cols = st.columns([5, 1])
-    with cols[0]:
-        st.text_input(
-            "Ask a follow-up question",
-            key="chat_input",
-            placeholder="e.g., What about regulatory risks? Summarize only earnings-related articles.",
-            disabled=not ticker,
-        )
-    with cols[1]:
-        st.button("Send", type="primary", use_container_width=True, on_click=on_chat_send)
+    # Render tool calls from last response (if any)
+    if st.session_state.chat_tool_calls:
+        with st.expander("🔧 Tool Calls Made", expanded=False):
+            for i, tc in enumerate(st.session_state.chat_tool_calls, 1):
+                st.markdown(f"**{i}. web_search** — `{tc.get('query', '')}`")
+                result = tc.get("result", "")
+                if result:
+                    with st.expander("Result"):
+                        st.markdown(result)
+
+    # Chat input (Enter to send)
+    st.text_input(
+        "Ask a follow-up question",
+        key="chat_input",
+        placeholder="e.g., What about regulatory risks? Summarize only earnings-related articles.",
+        disabled=not ticker,
+        on_change=on_chat_send,
+    )
 else:
     st.info("Enter a ticker to start chatting.")
 

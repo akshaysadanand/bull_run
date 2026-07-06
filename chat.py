@@ -132,10 +132,14 @@ def ask_followup(
         summary: Optional initial summary for context.
 
     Returns:
-        Dict with 'answer' (LLM response text) and 'history' (updated message list).
+        Dict with 'answer' (LLM response text), 'history' (updated message list),
+        and 'tool_calls' (list of {tool, query, result} dicts for UI display).
     """
     if not question.strip():
-        return {"answer": "", "history": history}
+        return {"answer": "", "history": history, "tool_calls": []}
+
+    # Reset tool calls tracking for this invocation
+    ask_followup._tool_calls = []
 
     client = OpenAI(base_url=llm_url, api_key="not-needed")
 
@@ -174,11 +178,14 @@ def ask_followup(
                     {"role": "user", "content": question},
                     {"role": "assistant", "content": error_answer},
                 ]
-                return {"answer": error_answer, "history": new_history}
+                return {"answer": error_answer, "history": new_history, "tool_calls": ask_followup._tool_calls}
 
         message = response.choices[0].message
 
         if message.tool_calls:
+            # Collect tool call metadata for UI display
+            tool_call_info = []
+
             # Append assistant's tool call message FIRST (API expects: assistant -> tool results)
             messages.append({
                 "role": "assistant",
@@ -202,12 +209,22 @@ def ask_followup(
                     query = args.get("query", "")
                     search_result = _web_search(query)
 
+                    tool_call_info.append({
+                        "tool": "web_search",
+                        "query": query,
+                        "result": search_result,
+                    })
+
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "content": search_result,
                     })
 
+            # Store tool call info for this iteration
+            if not hasattr(ask_followup, "_tool_calls"):
+                ask_followup._tool_calls = []
+            ask_followup._tool_calls.extend(tool_call_info)
             continue  # Loop back to call LLM again with tool results
 
         # Text response — done
@@ -216,7 +233,11 @@ def ask_followup(
             {"role": "user", "content": question},
             {"role": "assistant", "content": answer},
         ]
-        return {"answer": answer, "history": new_history}
+        return {
+            "answer": answer,
+            "history": new_history,
+            "tool_calls": ask_followup._tool_calls,
+        }
 
     # Exceeded max iterations — call LLM one final time with accumulated context (no tools)
     try:
@@ -233,4 +254,8 @@ def ask_followup(
         {"role": "user", "content": question},
         {"role": "assistant", "content": answer},
     ]
-    return {"answer": answer, "history": new_history}
+    return {
+        "answer": answer,
+        "history": new_history,
+        "tool_calls": ask_followup._tool_calls,
+    }

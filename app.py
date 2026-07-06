@@ -473,6 +473,7 @@ if ticker:
 
     # Streaming: process pending question
     if st.session_state.chat_pending:
+        import re
         from chat import ask_followup_stream
 
         pending = st.session_state.chat_pending
@@ -497,12 +498,28 @@ if ticker:
                     status.markdown(f"**{i}. web_search** — `{tc.get('query', '')}`")
             st.session_state.chat_tool_calls = result["tool_calls"]
 
-        # Stream the response
+        # Stream the response (strip thinking tags for display)
+        def _strip_thinking(text):
+            text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r'<thinking>.*?</thinking>', '', text, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r'\s*<think>.*$', '', text, flags=re.DOTALL | re.IGNORECASE)
+            return text.strip()
+
+        def _clean_stream(raw_stream):
+            for chunk in raw_stream:
+                yield _strip_thinking(chunk)
+
         with st.container():
             st.markdown("**Assistant:**")
-            full_answer = st.write_stream(result["stream"])
+            full_answer = st.write_stream(_clean_stream(result["stream"]))
 
-        # Save to history after streaming completes
+        # Show thinking in dropdown if available
+        thinking = getattr(ask_followup_stream, "_thinking", "")
+        if thinking:
+            with st.expander("🧠 Model's Reasoning Process"):
+                st.markdown(thinking)
+
+        # Save to history after streaming completes (clean text only)
         st.session_state.chat_history = pending["history"] + [
             {"role": "user", "content": pending["question"]},
             {"role": "assistant", "content": full_answer},

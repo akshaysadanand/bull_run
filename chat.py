@@ -372,16 +372,12 @@ def ask_followup_stream(
             ask_followup_stream._tool_calls.extend(tool_call_info)
             continue
 
-        # Text response (no tool calls) — stream it instead
-        def text_stream():
-            yield (message.content or "")
-        return {
-            "stream": text_stream(),
-            "tool_calls": ask_followup_stream._tool_calls,
-            "error": None,
-        }
+        # Text response (no tool calls) — stream a new call with same messages
+        break  # Exit loop, fall through to streaming final call
 
-    # Exceeded max iterations — stream final LLM call
+    # Stream final LLM call and extract thinking tags
+    import re
+
     def final_stream():
         try:
             stream = client.chat.completions.create(
@@ -390,10 +386,16 @@ def ask_followup_stream(
                 temperature=0.1,
                 stream=True,
             )
+            full_text = ""
             for chunk in stream:
                 delta = chunk.choices[0].delta.content
                 if delta:
+                    full_text += delta
                     yield delta
+            # Extract thinking after streaming completes
+            thinking_parts = re.findall(r'<think>(.*?)</think>', full_text, flags=re.DOTALL | re.IGNORECASE)
+            thinking_parts += re.findall(r'<thinking>(.*?)</thinking>', full_text, flags=re.DOTALL | re.IGNORECASE)
+            ask_followup_stream._thinking = "\n".join(p.strip() for p in thinking_parts if p.strip())
         except Exception as e:
             logger.exception("Streaming failed")
             yield f"Streaming error: {e}"

@@ -476,6 +476,10 @@ if ticker:
         from chat import ask_followup_stream
 
         pending = st.session_state.chat_pending
+
+        # Show user's question immediately
+        st.markdown(f"**You:** {pending['question']}")
+
         result = ask_followup_stream(
             question=pending["question"],
             ticker=pending["ticker"],

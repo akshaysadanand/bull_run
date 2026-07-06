@@ -72,34 +72,32 @@ class _MCPClient:
             cls._instance = cls()
         return cls._instance
 
-    def __init__(self):
-        self._dedicated_loop = None
-
-    def _get_dedicated_loop(self) -> asyncio.AbstractEventLoop:
-        """Get or create a dedicated event loop for MCP operations.
-
-        Uses a dedicated loop to avoid conflicts with Streamlit's running event loop.
-        """
-        if self._dedicated_loop is None or self._dedicated_loop.is_closed():
-            self._dedicated_loop = asyncio.new_event_loop()
-        return self._dedicated_loop
-
     def _run_in_dedicated_loop(self, coro):
         """Run a coroutine in a dedicated event loop thread.
 
-        This avoids conflicts with any already-running event loop
-        (e.g. Streamlit's internal loop).
+        Creates a fresh event loop for each call to ensure clean teardown
+        of subprocess transports. Avoids conflicts with any already-running
+        event loop (e.g. Streamlit's internal loop).
         """
-        loop = self._get_dedicated_loop()
         result_holder = []
         error_holder = []
 
         def target():
+            loop = asyncio.new_event_loop()
             try:
                 asyncio.set_event_loop(loop)
                 result_holder.append(loop.run_until_complete(coro))
             except Exception as e:
                 error_holder.append(e)
+            finally:
+                # Close the loop before exiting the thread so that
+                # subprocess transports are cleaned up while the loop
+                # is still accessible (avoids __del__ "Event loop is closed" errors).
+                try:
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                except RuntimeError:
+                    pass  # Loop may already be closed
+                loop.close()
 
         t = threading.Thread(target=target, daemon=True)
         t.start()
@@ -117,8 +115,8 @@ class _MCPClient:
         Each call spawns a fresh MCP server process via stdio_client,
         initializes the session, calls the tool, then tears down.
 
-        Always runs in a dedicated thread to avoid conflicts with any
-        already-running event loop (e.g. Streamlit).
+        Runs in a dedicated thread with a fresh event loop to avoid
+        conflicts with any already-running event loop (e.g. Streamlit).
         """
         server_params = StdioServerParameters(
             command="bash",

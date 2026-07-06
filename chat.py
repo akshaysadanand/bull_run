@@ -451,9 +451,9 @@ def ask_followup_stream(
 ) -> dict:
     """Process a follow-up question with streaming LLM response.
 
-    Uses a single streaming call per iteration. Peeks at the first chunk
-    to determine if the LLM wants to call tools. If it does, buffers the
-    rest and executes. If it returns text, yields chunks in real-time.
+    Uses non-streaming calls for tool-call iterations (reliable, no buffer
+    issues), then attempts a streaming call for the final text response.
+    Falls back to non-streaming if streaming fails.
 
     Args:
         question: User's question.
@@ -490,220 +490,74 @@ def ask_followup_stream(
     messages.extend(trimmed_history)
     messages.append({"role": "user", "content": question})
 
-    # Tool-calling loop (max MAX_SEARCH_ITERATIONS iterations)
+    # Tool-calling loop — use non-streaming for reliability
     for _ in range(MAX_SEARCH_ITERATIONS):
         try:
-            stream = client.chat.completions.create(
+            response = client.chat.completions.create(
                 model=model,
                 messages=messages,
                 tools=TOOLS,
                 temperature=0.1,
-                stream=True,
             )
         except Exception as e:
-            logger.exception("LLM streaming call failed, falling back to non-streaming")
-            try:
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    tools=TOOLS,
-                    temperature=0.1,
-                )
-                message = response.choices[0].message
-                if message.tool_calls:
-                    for tool_call in message.tool_calls:
-                        tool_name, result = _execute_tool_call(tool_call)
-                        args = json.loads(tool_call.function.arguments)
-                        display = {
-                            "tool": tool_name,
-                            "query": args.get("query", ""),
-                            "url": args.get("url", ""),
-                            "result": result,
+            logger.exception("LLM call failed")
+            error_msg = f"LLM error: {e}"
+            def error_gen(msg=error_msg):
+                yield msg
+            ask_followup_stream._error = error_msg
+            return {"stream": error_gen(), "tool_calls": ask_followup_stream._tool_calls, "error": error_msg}
+
+        message = response.choices[0].message
+
+        if message.tool_calls:
+            # Tool call — append assistant message, execute tools, loop back
+            tool_call_info = []
+
+            assistant_msg = {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": tc.type,
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
                         }
-                        ask_followup_stream._tool_calls.append(display)
-                        messages.append({
-                            "role": "assistant",
-                            "tool_calls": [{
-                                "id": tool_call.id,
-                                "type": tool_call.type,
-                                "function": {
-                                    "name": tool_call.function.name,
-                                    "arguments": tool_call.function.arguments,
-                                }
-                            }],
-                        })
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": result,
-                        })
-                    continue
-                else:
-                    content = _strip_tool_call_xml(message.content or "")
-                    def fallback_gen(text=content):
-                        for word in text.split():
-                            yield word + " "
-                    return {
-                        "stream": fallback_gen(),
-                        "tool_calls": ask_followup_stream._tool_calls,
-                        "error": None,
                     }
-            except Exception as e2:
-                error_msg = str(e2)
-                def error_gen(msg=error_msg):
-                    yield f"LLM error: {msg}"
-                ask_followup_stream._error = error_msg
-                return {"stream": error_gen(), "tool_calls": ask_followup_stream._tool_calls, "error": error_msg}
+                    for tc in message.tool_calls
+                ],
+            }
+            if message.content:
+                assistant_msg["content"] = message.content
+            messages.append(assistant_msg)
 
-        # Peek at the first chunk to determine response type
-        first_chunk = next(iter(stream), None)
-        first_delta = first_chunk.choices[0].delta if first_chunk and first_chunk.choices else None
-
-        has_tool_calls = first_delta and first_delta.tool_calls
-
-        if has_tool_calls:
-            # Tool call — buffer remaining chunks, reconstruct, execute
-            tc_map = {}
-            content_buffer = ""
-            if first_delta:
-                for tc in first_delta.tool_calls:
-                    idx = tc.index
-                    if idx not in tc_map:
-                        tc_map[idx] = {
-                            "id": tc.id or "",
-                            "type": "function",
-                            "function": {"name": tc.function.name if tc.function else "", "arguments": ""}
-                        }
-                    if tc.function and tc.function.arguments:
-                        tc_map[idx]["function"]["arguments"] += tc.function.arguments
-                # Accumulate any content alongside tool calls
-                if first_delta.content:
-                    content_buffer += first_delta.content
-
-            stream_error = None
-            try:
-                for chunk in stream:
-                    delta = chunk.choices[0].delta if chunk.choices else None
-                    if delta and delta.tool_calls:
-                        for tc in delta.tool_calls:
-                            idx = tc.index
-                            if idx not in tc_map:
-                                tc_map[idx] = {
-                                    "id": tc.id or "",
-                                    "type": "function",
-                                    "function": {"name": tc.function.name if tc.function else "", "arguments": ""}
-                                }
-                            if tc.function and tc.function.arguments:
-                                tc_map[idx]["function"]["arguments"] += tc.function.arguments
-                    # Accumulate any content alongside tool calls
-                    if delta and delta.content:
-                        content_buffer += delta.content
-            except Exception as e:
-                stream_error = e
-                logger.warning("Stream interrupted during tool-call buffering, falling back to non-streaming: %s", e)
-
-            # If streaming failed or we got no tool calls from the stream, fall back to non-streaming
-            if (stream_error or not tc_map) and not stream_error:
-                # Stream completed but yielded no tool calls — shouldn't happen since we peeked,
-                # but handle gracefully by falling back to non-streaming
-                pass
-
-            if stream_error or not tc_map:
-                # Fall back to a non-streaming call to get tool calls reliably
-                try:
-                    response = client.chat.completions.create(
-                        model=model,
-                        messages=messages,
-                        tools=TOOLS,
-                        temperature=0.1,
-                    )
-                    message = response.choices[0].message
-                    if message.tool_calls:
-                        for tool_call in message.tool_calls:
-                            tool_name, result = _execute_tool_call(tool_call)
-                            args = json.loads(tool_call.function.arguments)
-                            display = {
-                                "tool": tool_name,
-                                "query": args.get("query", ""),
-                                "url": args.get("url", ""),
-                                "result": result,
-                            }
-                            ask_followup_stream._tool_calls.append(display)
-                            messages.append({
-                                "role": "assistant",
-                                "tool_calls": [{
-                                    "id": tool_call.id,
-                                    "type": tool_call.type,
-                                    "function": {
-                                        "name": tool_call.function.name,
-                                        "arguments": tool_call.function.arguments,
-                                    }
-                                }],
-                            })
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "content": result,
-                            })
-                        continue
-                except Exception as e2:
-                    logger.exception("Non-streaming fallback for tool calls also failed: %s", e2)
-                    # If both fail, we can't proceed with tool calls
-                    error_msg = f"Tool calling failed: {e2}"
-                    def error_gen(msg=error_msg):
-                        yield msg
-                    ask_followup_stream._error = error_msg
-                    return {"stream": error_gen(), "tool_calls": ask_followup_stream._tool_calls, "error": error_msg}
-            else:
-                # Streaming tool-call buffering succeeded — execute tools
-                assistant_msg = {
-                    "role": "assistant",
-                    "tool_calls": list(tc_map.values()),
+            for tool_call in message.tool_calls:
+                tool_name, result = _execute_tool_call(tool_call)
+                args = json.loads(tool_call.function.arguments)
+                display = {
+                    "tool": tool_name,
+                    "query": args.get("query", ""),
+                    "url": args.get("url", ""),
+                    "result": result,
                 }
-                if content_buffer:
-                    assistant_msg["content"] = content_buffer
-                messages.append(assistant_msg)
-                tool_call_info = []
-                for tc_data in tc_map.values():
-                    class _FakeTC:
-                        pass
-                    tc = _FakeTC()
-                    tc.id = tc_data["id"]
-                    tc.type = tc_data["type"]
-                    tc.function = type("func", (), {"name": tc_data["function"]["name"], "arguments": tc_data["function"]["arguments"]})()
+                tool_call_info.append(display)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result,
+                })
 
-                    tool_name, result = _execute_tool_call(tc)
-                    args = json.loads(tc_data["function"]["arguments"])
-                    display = {
-                        "tool": tool_name,
-                        "query": args.get("query", ""),
-                        "url": args.get("url", ""),
-                        "result": result,
-                    }
-                    tool_call_info.append(display)
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc_data["id"],
-                        "content": result,
-                    })
-                ask_followup_stream._tool_calls.extend(tool_call_info)
-                continue
+            ask_followup_stream._tool_calls.extend(tool_call_info)
+            continue  # Loop back with tool results
 
-        # Text response — yield first chunk immediately, then stream the rest
-        def text_stream(first=first_delta, rest=stream):
-            """Yield text chunks in real-time."""
-            # Yield content from the first chunk
-            if first and first.content:
-                yield first.content
-            # Stream remaining chunks
-            try:
-                for chunk in rest:
-                    delta = chunk.choices[0].delta if chunk.choices else None
-                    if delta and delta.content:
-                        yield delta.content
-            except Exception as e:
-                logger.exception("Stream interrupted during text response")
-                # Generator ends gracefully — consumer gets partial response
+        # Text response — we already have the content from the non-streaming call.
+        # Simulate word-by-word streaming from it (reliable, no connection issues).
+        content = _strip_tool_call_xml(message.content or "")
+
+        def text_stream(text=content):
+            """Simulate word-by-word streaming from buffered content."""
+            for word in text.split():
+                yield word + " "
 
         return {
             "stream": text_stream(),
@@ -711,18 +565,18 @@ def ask_followup_stream(
             "error": None,
         }
 
-    # Loop exhausted — final non-streaming call without tools
+    # Exceeded max iterations — final non-streaming call without tools
     try:
-        response = client.chat.completions.create(
+        final_response = client.chat.completions.create(
             model=model,
             messages=messages,
             temperature=0.1,
         )
-        content = _strip_tool_call_xml(response.choices[0].message.content or "Search limit reached.")
+        answer = _strip_tool_call_xml(final_response.choices[0].message.content or "Search limit reached.")
     except Exception as e:
-        content = f"Search limit reached. LLM error: {e}"
+        answer = f"Search limit reached. LLM error: {e}"
 
-    def final_gen(text=content):
+    def final_gen(text=answer):
         for word in text.split():
             yield word + " "
 

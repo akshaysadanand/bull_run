@@ -375,9 +375,7 @@ def ask_followup_stream(
         # Text response (no tool calls) — stream a new call with same messages
         break  # Exit loop, fall through to streaming final call
 
-    # Stream final LLM call and extract thinking tags
-    import re
-
+    # Stream final LLM call — try streaming, fall back to non-streaming if server doesn't support it
     def final_stream():
         try:
             stream = client.chat.completions.create(
@@ -386,19 +384,26 @@ def ask_followup_stream(
                 temperature=0.1,
                 stream=True,
             )
-            full_text = ""
             for chunk in stream:
                 delta = chunk.choices[0].delta.content
                 if delta:
-                    full_text += delta
                     yield delta
-            # Extract thinking after streaming completes
-            thinking_parts = re.findall(r'<think>(.*?)</think>', full_text, flags=re.DOTALL | re.IGNORECASE)
-            thinking_parts += re.findall(r'<thinking>(.*?)</thinking>', full_text, flags=re.DOTALL | re.IGNORECASE)
-            ask_followup_stream._thinking = "\n".join(p.strip() for p in thinking_parts if p.strip())
         except Exception as e:
-            logger.exception("Streaming failed")
-            yield f"Streaming error: {e}"
+            logger.warning("Streaming not supported, falling back to non-streaming: %s", e)
+            # Fall back to non-streaming call
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=0.1,
+                )
+                content = response.choices[0].message.content or ""
+                # Yield in word-sized chunks to simulate streaming
+                for word in content.split():
+                    yield word + " "
+            except Exception as e2:
+                logger.exception("Both streaming and non-streaming failed")
+                yield f"LLM error: {e2}"
 
     return {
         "stream": final_stream(),

@@ -1,5 +1,6 @@
 """Streamlit UI for the stock news aggregator."""
 
+import html
 import json
 from pathlib import Path
 
@@ -76,6 +77,12 @@ if "_preset_urls_raw" not in st.session_state:
     st.session_state._preset_urls_raw = None
 if "_last_ticker" not in st.session_state:
     st.session_state._last_ticker = "AAPL"
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "chat_tool_calls" not in st.session_state:
+    st.session_state.chat_tool_calls = []
+if "chat_pending" not in st.session_state:
+    st.session_state.chat_pending = None
 
 st.title("🐂 Bull Run — Stock News Aggregator")
 
@@ -214,6 +221,9 @@ def on_get_news():
     st.session_state.custom_summary = None
     st.session_state.custom_thinking = None
     st.session_state.custom_summary_error = None
+    st.session_state.chat_history = []
+    st.session_state.chat_tool_calls = []
+    st.session_state.chat_pending = None
     st.session_state.progress_step = 1
     st.session_state.progress_messages = []
     st.session_state.progress_done = False
@@ -314,6 +324,37 @@ def _render_summary(summary, summary_error, thinking, llm_url, model):
                 st.markdown(thinking)
     else:
         st.info("Waiting for results...")
+
+
+def on_chat_send():
+    """Callback for chat send (triggered by Enter key) — stores question as pending for streaming."""
+    question = st.session_state.get("chat_input", "").strip()
+    if not question:
+        return
+
+    articles = st.session_state.articles or []
+    custom_articles = st.session_state.custom_articles or []
+    all_articles = articles + custom_articles
+    summary = st.session_state.summary or None
+
+    # Combine Yahoo and custom summaries if both exist
+    if st.session_state.custom_summary:
+        combined_summary = (summary or "") + "\n\n" + (st.session_state.custom_summary or "")
+        summary = combined_summary.strip() or None
+
+    # Store pending question with all context for streaming phase
+    st.session_state.chat_pending = {
+        "question": question,
+        "ticker": ticker,
+        "history": st.session_state.chat_history,
+        "llm_url": llm_url,
+        "model": model,
+        "articles": all_articles if all_articles else None,
+        "summary": summary,
+    }
+    st.session_state.chat_tool_calls = []
+    st.session_state.chat_input = ""
+    st.rerun()
 
 
 # --- Main Panel ---
@@ -418,6 +459,109 @@ else:
                 )
 
     st.caption("News sourced from Yahoo Finance · Summarized by your local LLM")
+
+# --- Chat Section ---
+st.divider()
+st.header("💬 Ask about " + (ticker if ticker else "..."))
+
+if ticker:
+    # Render chat history
+    for msg in st.session_state.chat_history:
+        if msg["role"] == "user":
+            st.markdown(f"**You:** {msg['content']}")
+        elif msg["role"] == "assistant":
+            st.markdown(f"**Assistant:** {msg['content']}")
+
+    # Process pending question (non-streaming)
+    if st.session_state.chat_pending:
+        import re
+        from chat import ask_followup
+
+        pending = st.session_state.chat_pending
+
+        # Show user's question immediately
+        st.markdown(f"**You:** {pending['question']}")
+
+        # Show research status while processing
+        with st.status("🔍 Researching...", expanded=False) as status:
+            result = ask_followup(
+                question=pending["question"],
+                ticker=pending["ticker"],
+                history=pending["history"],
+                llm_url=pending["llm_url"],
+                model=pending["model"],
+                articles=pending["articles"],
+                summary=pending["summary"],
+            )
+
+            # Show tool calls made during research
+            if result["tool_calls"]:
+                status.markdown("**Tool calls made:**")
+                for i, tc in enumerate(result["tool_calls"], 1):
+                    tool = tc.get("tool", "unknown")
+                    if tool == "searxng_search":
+                        status.markdown(f"{i}. 🔎 web_search — `{tc.get('query', '')}`")
+                    elif tool == "web_scrape":
+                        url = tc.get("url", "")
+                        display_url = url[:80] + "..." if len(url) > 80 else url
+                        status.markdown(f"{i}. 📄 web_scrape — `{display_url}`")
+                    else:
+                        status.markdown(f"{i}. {tool}")
+        st.session_state.chat_tool_calls = result["tool_calls"]
+
+        # Strip thinking tags from answer
+        full_answer = result["answer"] or ""
+        thinking = ""
+        # Extract thinking content before stripping
+        for pattern in [r'<think>(.*?)</think>', r'<thinking>(.*?)</thinking>']:
+            matches = re.findall(pattern, full_answer, re.DOTALL | re.IGNORECASE)
+            if matches:
+                thinking = "\n".join(m.strip() for m in matches).strip()
+                break
+        # Clean answer — strip thinking tags
+        full_answer = re.sub(r'<think>.*?</think>', '', full_answer, flags=re.DOTALL | re.IGNORECASE)
+        full_answer = re.sub(r'<thinking>.*?</thinking>', '', full_answer, flags=re.DOTALL | re.IGNORECASE)
+        full_answer = re.sub(r'\s*<think>.*$', '', full_answer, flags=re.DOTALL | re.IGNORECASE)
+        full_answer = full_answer.strip()
+
+        # Render answer as proper markdown
+        st.markdown("**Assistant:**")
+        if full_answer:
+            st.markdown(full_answer)
+
+        # Show thinking in collapsible expander if present
+        if thinking:
+            with st.expander("🧠 Model's Reasoning Process"):
+                st.markdown(thinking)
+
+        # Save to history
+        st.session_state.chat_history = pending["history"] + [
+            {"role": "user", "content": pending["question"]},
+            {"role": "assistant", "content": full_answer},
+        ]
+        st.session_state.chat_pending = None
+
+    # Render tool calls from last response (if any, and not currently streaming)
+    elif st.session_state.chat_tool_calls:
+        with st.expander("🔧 Tool Calls Made", expanded=False):
+            for i, tc in enumerate(st.session_state.chat_tool_calls, 1):
+                st.markdown(f"**{i}. web_search** — `{tc.get('query', '')}`")
+                tc_result = tc.get("result", "")
+                if tc_result:
+                    with st.expander("Result"):
+                        st.markdown(tc_result)
+
+    # Chat input (Enter to send)
+    is_chatting = st.session_state.chat_pending is not None
+    st.text_input(
+        "Ask a follow-up question",
+        key="chat_input",
+        placeholder="e.g., What about regulatory risks? Summarize only earnings-related articles.",
+        disabled=not ticker or is_chatting,
+        on_change=on_chat_send,
+    )
+else:
+    st.info("Enter a ticker to start chatting.")
 
 # ── Run next progress step (after UI renders, triggers rerun) ──
 if st.session_state.progress_step is not None:

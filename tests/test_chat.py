@@ -174,7 +174,7 @@ def test_ask_followup_executes_tool_calls():
     mock_client.chat.completions.create.side_effect = [mock_response_tool, mock_response_text]
 
     with patch("chat.OpenAI", return_value=mock_client):
-        with patch("chat._web_search", return_value="[1] AAPL New Product Launch\n    URL: https://example.com\n    Apple announces new lineup."):
+        with patch("chat._web_search", return_value="[1] AAPL New Product Launch\n    URL: https://example.com\n    Apple announces new lineup.") as mock_search:
             result = ask_followup(
                 question="What's new with AAPL?",
                 ticker="AAPL",
@@ -186,3 +186,4 @@ def test_ask_followup_executes_tool_calls():
     # Verify LLM was called twice (tool call + final answer)
     assert mock_client.chat.completions.create.call_count == 2
     assert "new products" in result["answer"]
+    mock_search.assert_called_once_with("AAPL latest news")

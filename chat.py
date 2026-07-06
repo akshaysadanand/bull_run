@@ -179,20 +179,7 @@ def ask_followup(
         message = response.choices[0].message
 
         if message.tool_calls:
-            # Execute tool calls and append results
-            for tool_call in message.tool_calls:
-                if tool_call.function.name == "web_search":
-                    args = json.loads(tool_call.function.arguments)
-                    query = args.get("query", "")
-                    search_result = _web_search(query)
-
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": search_result,
-                    })
-
-            # Also append the assistant's tool call message
+            # Append assistant's tool call message FIRST (API expects: assistant -> tool results)
             messages.append({
                 "role": "assistant",
                 "tool_calls": [
@@ -207,6 +194,20 @@ def ask_followup(
                     for tc in message.tool_calls
                 ],
             })
+
+            # Then append tool results
+            for tool_call in message.tool_calls:
+                if tool_call.function.name == "web_search":
+                    args = json.loads(tool_call.function.arguments)
+                    query = args.get("query", "")
+                    search_result = _web_search(query)
+
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": search_result,
+                    })
+
             continue  # Loop back to call LLM again with tool results
 
         # Text response — done
@@ -217,8 +218,17 @@ def ask_followup(
         ]
         return {"answer": answer, "history": new_history}
 
-    # Exceeded max iterations
-    answer = "I've reached my search limit. Based on what I found, let me provide my best answer with the information available."
+    # Exceeded max iterations — call LLM one final time with accumulated context (no tools)
+    try:
+        final_response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=0.1,
+        )
+        answer = final_response.choices[0].message.content or "Search limit reached."
+    except Exception:
+        answer = "Search limit reached. I'll provide my best answer with the information I have."
+
     new_history = trimmed_history + [
         {"role": "user", "content": question},
         {"role": "assistant", "content": answer},

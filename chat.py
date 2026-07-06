@@ -33,7 +33,7 @@ def _strip_tool_call_xml(text: str) -> str:
     return text.strip()
 
 MCP_SERVER_DIR = Path.home() / "Projects" / "web-search-MCP"
-MAX_SEARCH_ITERATIONS = 3
+MAX_SEARCH_ITERATIONS = 5
 MAX_CHAT_TURNS = 10
 
 # LLM tool definitions - names match the MCP server's tool names
@@ -231,6 +231,16 @@ def _build_system_prompt(
     """
     year_hint = f"Today's year is {CURRENT_YEAR}. When searching for upcoming events, earnings, or catalysts, " \
                 f"use queries that target {CURRENT_YEAR} and {CURRENT_YEAR + 1}."
+    tool_instructions = (
+        "\n\nRESEARCH WORKFLOW (follow these steps):\n"
+        "1. Use searxng_search to find relevant URLs for the user's question.\n"
+        "2. From the search results, identify the most relevant URLs (articles, forum posts, press releases).\n"
+        "3. Use web_scrape to read the full content of those URLs — do NOT skip this step.\n"
+        "4. Synthesize your answer from the scraped content, not just from search snippets.\n\n"
+        "IMPORTANT: Search results only contain short snippets. You MUST use web_scrape on promising URLs "
+        "to get the full article content before forming your answer. Never answer based solely on search "
+        "snippets — always scrape at least 2-3 relevant pages."
+    )
     if articles and summary:
         articles_text = "\n".join(
             f"- {a.get('title', 'Untitled')} ({a.get('source', 'Unknown')}, {a.get('date', '')})"
@@ -243,17 +253,17 @@ def _build_system_prompt(
             f"ARTICLES:\n{articles_text}\n\n"
             f"{year_hint}\n\n"
             f"Answer the user's question based on this context. "
-            f"If you need additional current information, use the searxng_search tool to find it, "
-            f"then use web_scrape to read specific URLs in detail. "
+            f"If you need additional current information, follow the research workflow below.\n"
             f"Be concise and cite sources when referencing specific claims."
+            f"{tool_instructions}"
         )
     else:
         return (
             f"You are a financial news analyst helping a user research {ticker}.\n"
             f"{year_hint}\n\n"
-            f"Use the searxng_search tool to find current information, "
-            f"then use web_scrape to read specific URLs in detail. "
+            f"Follow the research workflow below to answer the user's question.\n"
             f"Be concise and cite sources when referencing specific claims."
+            f"{tool_instructions}"
         )
 
 
@@ -270,10 +280,14 @@ def _execute_tool_call(tool_call) -> tuple[str, str]:
     args = json.loads(tool_call.function.arguments)
 
     if name == "searxng_search":
-        query = args.get("query", "")
+        query = args.get("query", "").strip()
+        if not query:
+            return ("searxng_search", "Error: query parameter is required and cannot be empty.")
         return ("searxng_search", _web_search(query))
     elif name == "web_scrape":
-        url = args.get("url", "")
+        url = args.get("url", "").strip()
+        if not url:
+            return ("web_scrape", "Error: url parameter is required and cannot be empty.")
         return ("web_scrape", _web_scrape(url))
     else:
         return (name, f"Unknown tool: {name}")

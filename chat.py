@@ -1,24 +1,28 @@
-"""Multi-turn chat with web search tool calling for stock news analysis."""
+"""Multi-turn chat with MCP-based web search and scrape for stock news analysis."""
 
+import asyncio
 import json
 import logging
+import threading
+from pathlib import Path
 from typing import Optional
-from urllib.parse import quote_plus
-from urllib.request import urlopen
 
+from mcp.client.session import ClientSession
+from mcp.client.stdio import StdioServerParameters, stdio_client
 from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
-SEARXNG_URL = "http://localhost:8088"
+MCP_SERVER_SCRIPT = Path.home() / "Projects" / "web-search-MCP" / "start.sh"
 MAX_SEARCH_ITERATIONS = 3
 MAX_CHAT_TURNS = 10
 
+# LLM tool definitions - names match the MCP server's tool names
 WEB_SEARCH_TOOL = {
     "type": "function",
     "function": {
-        "name": "web_search",
-        "description": "Search the web for current information about a topic",
+        "name": "searxng_search",
+        "description": "Search the web for current information about a topic using SearXNG",
         "parameters": {
             "type": "object",
             "properties": {
@@ -31,6 +35,141 @@ WEB_SEARCH_TOOL = {
         }
     }
 }
+
+WEB_SCRAPE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_scrape",
+        "description": (
+            "Scrape the full text content from a specific URL using Playwright. "
+            "Use this to read articles, press releases, or any webpage in detail."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The full URL to scrape (e.g., https://example.com/article)",
+                    "pattern": "^https?://"
+                }
+            },
+            "required": ["url"]
+        }
+    }
+}
+
+TOOLS = [WEB_SEARCH_TOOL, WEB_SCRAPE_TOOL]
+
+
+class _MCPClient:
+    """Singleton MCP client that manages a single stdio connection to the web-search MCP server."""
+
+    _instance = None
+
+    @classmethod
+    def get(cls) -> "_MCPClient":
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def __init__(self):
+        self._dedicated_loop = None
+
+    def _get_dedicated_loop(self) -> asyncio.AbstractEventLoop:
+        """Get or create a dedicated event loop for MCP operations.
+
+        Uses a dedicated loop to avoid conflicts with Streamlit's running event loop.
+        """
+        if self._dedicated_loop is None or self._dedicated_loop.is_closed():
+            self._dedicated_loop = asyncio.new_event_loop()
+        return self._dedicated_loop
+
+    def _run_in_dedicated_loop(self, coro):
+        """Run a coroutine in a dedicated event loop thread.
+
+        This avoids conflicts with any already-running event loop
+        (e.g. Streamlit's internal loop).
+        """
+        loop = self._get_dedicated_loop()
+        result_holder = []
+        error_holder = []
+
+        def target():
+            try:
+                asyncio.set_event_loop(loop)
+                result_holder.append(loop.run_until_complete(coro))
+            except Exception as e:
+                error_holder.append(e)
+
+        t = threading.Thread(target=target, daemon=True)
+        t.start()
+        t.join(timeout=30)
+
+        if t.is_alive():
+            raise TimeoutError("MCP tool call timed out after 30 seconds")
+        if error_holder:
+            raise error_holder[0]
+        return result_holder[0]
+
+    def call_tool(self, tool_name: str, arguments: dict) -> str:
+        """Call an MCP tool synchronously and return the text result.
+
+        Each call spawns a fresh MCP server process via stdio_client,
+        initializes the session, calls the tool, then tears down.
+
+        Always runs in a dedicated thread to avoid conflicts with any
+        already-running event loop (e.g. Streamlit).
+        """
+        server_params = StdioServerParameters(
+            command="bash",
+            args=[str(MCP_SERVER_SCRIPT)],
+        )
+
+        async def _call():
+            async with stdio_client(server_params) as (read, write):
+                session = ClientSession(read, write)
+                async with session:
+                    await session.initialize()
+                    result = await session.call_tool(tool_name, arguments)
+                    return result
+
+        try:
+            result = self._run_in_dedicated_loop(_call())
+            texts = [
+                c.text if hasattr(c, "text") else str(c)
+                for c in result.content
+                if hasattr(c, "type") and c.type == "text"
+            ]
+            return "\n".join(texts) if texts else "No content returned."
+        except Exception as e:
+            logger.exception("MCP tool call failed for %s", tool_name)
+            return f"MCP call failed: {e}"
+
+
+def _web_search(query: str) -> str:
+    """Search the web via MCP server's searxng_search tool.
+
+    Args:
+        query: Search query string.
+
+    Returns:
+        Formatted search results text.
+    """
+    mcp = _MCPClient.get()
+    return mcp.call_tool("searxng_search", {"query": query})
+
+
+def _web_scrape(url: str) -> str:
+    """Scrape a URL via MCP server's web_scrape tool (uses Playwright).
+
+    Args:
+        url: The URL to scrape.
+
+    Returns:
+        Text content from the page.
+    """
+    mcp = _MCPClient.get()
+    return mcp.call_tool("web_scrape", {"url": url})
 
 
 def _build_system_prompt(
@@ -59,56 +198,39 @@ def _build_system_prompt(
             f"INITIAL SUMMARY:\n{summary}\n\n"
             f"ARTICLES:\n{articles_text}\n\n"
             f"Answer the user's question based on this context. "
-            f"If you need additional current information, use the web_search tool. "
+            f"If you need additional current information, use the searxng_search tool to find it, "
+            f"then use web_scrape to read specific URLs in detail. "
             f"Be concise and cite sources when referencing specific claims."
         )
     else:
         return (
             f"You are a financial news analyst helping a user research {ticker}.\n"
-            f"Use the web_search tool to find current information. "
+            f"Use the searxng_search tool to find current information, "
+            f"then use web_scrape to read specific URLs in detail. "
             f"Be concise and cite sources when referencing specific claims."
         )
 
 
-def _web_search(query: str) -> str:
-    """Search the web via SearXNG and return formatted text results.
+def _execute_tool_call(tool_call) -> tuple[str, str]:
+    """Execute an LLM tool call and return (tool_name, result_text).
 
     Args:
-        query: Search query string.
+        tool_call: The tool call object from the LLM response.
 
     Returns:
-        Formatted text with titles, URLs, and snippets from top results.
-        Empty string on failure.
+        Tuple of (tool_name, result_text).
     """
-    url = f"{SEARXNG_URL}/search?q={quote_plus(query)}&format=json"
-    try:
-        with urlopen(url, timeout=10) as response:
-            data = json.loads(response.read().decode())
+    name = tool_call.function.name
+    args = json.loads(tool_call.function.arguments)
 
-    except Exception as e:
-        logger.exception("Web search failed for query: %s", query)
-        return f"Search failed: {e}"
-
-    results = data.get("results", [])
-    if not results:
-        return "No results found."
-
-    lines = []
-    for i, r in enumerate(results[:5], 1):
-        title = r.get("title", "Untitled")
-        url = r.get("url", "")
-        content = r.get("content", "")
-        lines.append(f"[{i}] {title}")
-        if url:
-            lines.append(f"    URL: {url}")
-        if content:
-            snippet = content[:300]
-            if len(content) > 300:
-                snippet += "..."
-            lines.append(f"    {snippet}")
-        lines.append("")
-
-    return "\n".join(lines)
+    if name == "searxng_search":
+        query = args.get("query", "")
+        return ("searxng_search", _web_search(query))
+    elif name == "web_scrape":
+        url = args.get("url", "")
+        return ("web_scrape", _web_scrape(url))
+    else:
+        return (name, f"Unknown tool: {name}")
 
 
 def ask_followup(
@@ -120,7 +242,7 @@ def ask_followup(
     articles: Optional[list[dict]] = None,
     summary: Optional[str] = None,
 ) -> dict:
-    """Process a follow-up question with multi-turn chat and web search tool calling.
+    """Process a follow-up question with multi-turn chat and MCP tool calling.
 
     Args:
         question: User's question.
@@ -142,7 +264,6 @@ def ask_followup(
     ask_followup._tool_calls = []
 
     client = OpenAI(base_url=llm_url, api_key="not-needed")
-
     system_prompt = _build_system_prompt(ticker, articles, summary)
 
     messages = [
@@ -160,7 +281,7 @@ def ask_followup(
             response = client.chat.completions.create(
                 model=model,
                 messages=messages,
-                tools=[WEB_SEARCH_TOOL],
+                tools=TOOLS,
                 temperature=0.1,
             )
         except Exception as e:
@@ -204,22 +325,31 @@ def ask_followup(
 
             # Then append tool results
             for tool_call in message.tool_calls:
-                if tool_call.function.name == "web_search":
-                    args = json.loads(tool_call.function.arguments)
-                    query = args.get("query", "")
-                    search_result = _web_search(query)
+                tool_name, result = _execute_tool_call(tool_call)
 
-                    tool_call_info.append({
-                        "tool": "web_search",
-                        "query": query,
-                        "result": search_result,
-                    })
+                # Build display info based on tool type
+                args = json.loads(tool_call.function.arguments)
+                if tool_name == "searxng_search":
+                    display = {
+                        "tool": "searxng_search",
+                        "query": args.get("query", ""),
+                        "result": result,
+                    }
+                elif tool_name == "web_scrape":
+                    display = {
+                        "tool": "web_scrape",
+                        "url": args.get("url", ""),
+                        "result": result,
+                    }
+                else:
+                    display = {"tool": tool_name, "result": result}
 
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": search_result,
-                    })
+                tool_call_info.append(display)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result,
+                })
 
             # Store tool call info for this iteration
             if not hasattr(ask_followup, "_tool_calls"):
@@ -227,7 +357,7 @@ def ask_followup(
             ask_followup._tool_calls.extend(tool_call_info)
             continue  # Loop back to call LLM again with tool results
 
-        # Text response — done
+        # Text response - done
         answer = message.content or ""
         new_history = trimmed_history + [
             {"role": "user", "content": question},
@@ -239,7 +369,7 @@ def ask_followup(
             "tool_calls": ask_followup._tool_calls,
         }
 
-    # Exceeded max iterations — call LLM one final time with accumulated context (no tools)
+    # Exceeded max iterations - call LLM one final time with accumulated context (no tools)
     try:
         final_response = client.chat.completions.create(
             model=model,
@@ -311,13 +441,15 @@ def ask_followup_stream(
     messages.extend(trimmed_history)
     messages.append({"role": "user", "content": question})
 
+    content = ""
+
     # Tool-calling loop (max MAX_SEARCH_ITERATIONS iterations)
     for _ in range(MAX_SEARCH_ITERATIONS):
         try:
             response = client.chat.completions.create(
                 model=model,
                 messages=messages,
-                tools=[WEB_SEARCH_TOOL],
+                tools=TOOLS,
                 temperature=0.1,
             )
         except Exception as e:
@@ -355,25 +487,35 @@ def ask_followup_stream(
             })
 
             for tool_call in message.tool_calls:
-                if tool_call.function.name == "web_search":
-                    args = json.loads(tool_call.function.arguments)
-                    query = args.get("query", "")
-                    search_result = _web_search(query)
-                    tool_call_info.append({
-                        "tool": "web_search",
-                        "query": query,
-                        "result": search_result,
-                    })
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": search_result,
-                    })
+                tool_name, result = _execute_tool_call(tool_call)
+
+                args = json.loads(tool_call.function.arguments)
+                if tool_name == "searxng_search":
+                    display = {
+                        "tool": "searxng_search",
+                        "query": args.get("query", ""),
+                        "result": result,
+                    }
+                elif tool_name == "web_scrape":
+                    display = {
+                        "tool": "web_scrape",
+                        "url": args.get("url", ""),
+                        "result": result,
+                    }
+                else:
+                    display = {"tool": tool_name, "result": result}
+
+                tool_call_info.append(display)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result,
+                })
 
             ask_followup_stream._tool_calls.extend(tool_call_info)
             continue
 
-        # Text response (no tool calls) — get final answer
+        # Text response (no tool calls) - get final answer
         try:
             response = client.chat.completions.create(
                 model=model,
@@ -384,6 +526,19 @@ def ask_followup_stream(
         except Exception as e:
             logger.exception("LLM call failed")
             content = f"LLM error: {e}"
+
+    # If loop exhausted without text response, make a final call without tools
+    if not content:
+        try:
+            final_response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.1,
+            )
+            content = final_response.choices[0].message.content or "Search limit reached."
+        except Exception as e:
+            logger.exception("Final LLM call failed")
+            content = f"Search limit reached. LLM error: {e}"
 
     def final_stream():
         # Yield in word-sized chunks for simulated streaming

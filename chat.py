@@ -3,7 +3,9 @@
 import asyncio
 import json
 import logging
+import re
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -12,6 +14,23 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 from openai import OpenAI
 
 logger = logging.getLogger(__name__)
+
+CURRENT_YEAR = datetime.now().year
+
+
+def _strip_tool_call_xml(text: str) -> str:
+    """Strip raw tool call XML (\u2458function=...\u2459) from LLM content.
+
+    Some LLMs include the raw function-calling syntax in the content field
+    alongside structured tool_calls. This strips those artifacts.
+    """
+    # Match <tool_call><function=name> ... </function></tool_call> patterns
+    text = re.sub(r'\u2458\s*<function=[^>]*>.*?</function>\s*\u2459', '', text, flags=re.DOTALL)
+    # Match <tool_call><function=name> <parameter=...> ... </parameter> </function></tool_call> (inline)
+    text = re.sub(r'\u2458\s*<function=[^>]*>\s*<parameter=[^>]*>.*?</function>\s*\u2459', '', text, flags=re.DOTALL)
+    # Match unclosed <tool_call><function=... patterns
+    text = re.sub(r'\u2458\s*<function=[^>]*>.*$', '', text, flags=re.DOTALL | re.MULTILINE)
+    return text.strip()
 
 MCP_SERVER_SCRIPT = Path.home() / "Projects" / "web-search-MCP" / "start.sh"
 MAX_SEARCH_ITERATIONS = 3
@@ -62,7 +81,12 @@ TOOLS = [WEB_SEARCH_TOOL, WEB_SCRAPE_TOOL]
 
 
 class _MCPClient:
-    """Singleton MCP client that manages a single stdio connection to the web-search MCP server."""
+    """Singleton MCP client with a persistent stdio connection to the web-search MCP server.
+
+    Starts the MCP server subprocess once in a background thread and keeps
+    the session alive for the lifetime of the application. Tool calls are
+    queued into the persistent event loop via asyncio.run_coroutine_threadsafe.
+    """
 
     _instance = None
 
@@ -72,76 +96,88 @@ class _MCPClient:
             cls._instance = cls()
         return cls._instance
 
-    def _run_in_dedicated_loop(self, coro):
-        """Run a coroutine in a dedicated event loop thread.
+    def __init__(self):
+        self._loop = None
+        self._session = None
+        self._stdio = None
+        self._thread = None
+        self._ready_event = threading.Event()
+        self._started = False
+        self._lock = threading.Lock()
 
-        Creates a fresh event loop for each call to ensure clean teardown
-        of subprocess transports. Avoids conflicts with any already-running
-        event loop (e.g. Streamlit's internal loop).
-        """
-        result_holder = []
-        error_holder = []
+        # Start the persistent server thread
+        self._start_server()
 
+    def _start_server(self):
+        """Start the MCP server subprocess in a background thread."""
         def target():
             loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._loop = loop
+
             try:
-                asyncio.set_event_loop(loop)
-                result_holder.append(loop.run_until_complete(coro))
+                server_params = StdioServerParameters(
+                    command="bash",
+                    args=[str(MCP_SERVER_SCRIPT)],
+                )
+
+                async def _init():
+                    stdio = stdio_client(server_params)
+                    read, write = await stdio.__aenter__()
+                    session = ClientSession(read, write)
+                    await session.__aenter__()
+                    await session.initialize()
+                    return stdio, session
+
+                self._stdio, self._session = loop.run_until_complete(_init())
+                self._ready_event.set()
+                logger.info("MCP server connected and ready.")
+
+                # Keep the thread alive — run the loop until the process exits
+                loop.run_forever()
             except Exception as e:
-                error_holder.append(e)
-            finally:
-                # Close the loop before exiting the thread so that
-                # subprocess transports are cleaned up while the loop
-                # is still accessible (avoids __del__ "Event loop is closed" errors).
-                try:
-                    loop.run_until_complete(loop.shutdown_asyncgens())
-                except RuntimeError:
-                    pass  # Loop may already be closed
-                loop.close()
+                logger.exception("MCP server initialization failed")
+                self._ready_event.set()  # Unblock waiters so they can fail gracefully
 
-        t = threading.Thread(target=target, daemon=True)
-        t.start()
-        t.join(timeout=30)
+        self._thread = threading.Thread(target=target, daemon=True)
+        self._thread.start()
+        self._started = True
 
-        if t.is_alive():
-            raise TimeoutError("MCP tool call timed out after 30 seconds")
-        if error_holder:
-            raise error_holder[0]
-        return result_holder[0]
+    @property
+    def is_available(self) -> bool:
+        """Check if the MCP server is available and ready."""
+        return self._session is not None and self._loop is not None
 
     def call_tool(self, tool_name: str, arguments: dict) -> str:
-        """Call an MCP tool synchronously and return the text result.
+        """Call an MCP tool synchronously using the persistent session.
 
-        Each call spawns a fresh MCP server process via stdio_client,
-        initializes the session, calls the tool, then tears down.
-
-        Runs in a dedicated thread with a fresh event loop to avoid
-        conflicts with any already-running event loop (e.g. Streamlit).
+        Blocks until the tool call completes (up to 30 seconds).
         """
-        server_params = StdioServerParameters(
-            command="bash",
-            args=[str(MCP_SERVER_SCRIPT)],
-        )
+        # Wait for the server to be ready (up to 10 seconds)
+        if not self._ready_event.wait(timeout=10):
+            return "MCP server failed to start."
 
+        if not self.is_available:
+            return "MCP server is not available."
+
+        # Submit the tool call to the persistent event loop
         async def _call():
-            async with stdio_client(server_params) as (read, write):
-                session = ClientSession(read, write)
-                async with session:
-                    await session.initialize()
-                    result = await session.call_tool(tool_name, arguments)
-                    return result
+            result = await self._session.call_tool(tool_name, arguments)
+            return result
 
+        future = asyncio.run_coroutine_threadsafe(_call(), self._loop)
         try:
-            result = self._run_in_dedicated_loop(_call())
-            texts = [
-                c.text if hasattr(c, "text") else str(c)
-                for c in result.content
-                if hasattr(c, "type") and c.type == "text"
-            ]
-            return "\n".join(texts) if texts else "No content returned."
+            result = future.result(timeout=30)
         except Exception as e:
             logger.exception("MCP tool call failed for %s", tool_name)
             return f"MCP call failed: {e}"
+
+        texts = [
+            c.text if hasattr(c, "text") else str(c)
+            for c in result.content
+            if hasattr(c, "type") and c.type == "text"
+        ]
+        return "\n".join(texts) if texts else "No content returned."
 
 
 def _web_search(query: str) -> str:
@@ -185,6 +221,8 @@ def _build_system_prompt(
     Returns:
         System prompt string tailored to available context.
     """
+    year_hint = f"Today's year is {CURRENT_YEAR}. When searching for upcoming events, earnings, or catalysts, " \
+                f"use queries that target {CURRENT_YEAR} and {CURRENT_YEAR + 1}."
     if articles and summary:
         articles_text = "\n".join(
             f"- {a.get('title', 'Untitled')} ({a.get('source', 'Unknown')}, {a.get('date', '')})"
@@ -195,6 +233,7 @@ def _build_system_prompt(
             f"You have access to the following context:\n\n"
             f"INITIAL SUMMARY:\n{summary}\n\n"
             f"ARTICLES:\n{articles_text}\n\n"
+            f"{year_hint}\n\n"
             f"Answer the user's question based on this context. "
             f"If you need additional current information, use the searxng_search tool to find it, "
             f"then use web_scrape to read specific URLs in detail. "
@@ -203,6 +242,7 @@ def _build_system_prompt(
     else:
         return (
             f"You are a financial news analyst helping a user research {ticker}.\n"
+            f"{year_hint}\n\n"
             f"Use the searxng_search tool to find current information, "
             f"then use web_scrape to read specific URLs in detail. "
             f"Be concise and cite sources when referencing specific claims."

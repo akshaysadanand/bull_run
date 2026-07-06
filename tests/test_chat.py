@@ -3,94 +3,65 @@
 import json
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch, mock_open
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from chat import _build_system_prompt, _web_search
+from chat import _build_system_prompt, _web_search, _web_scrape
 
 
-def test_web_search_returns_formatted_results():
-    """Verify web_search formats SearXNG results into readable text."""
-    mock_json = {
-        "results": [
-            {
-                "title": "AAPL Earnings Beat",
-                "url": "https://example.com/aapl-earnings",
-                "content": "Apple reported strong Q2 results beating expectations.",
-            },
-            {
-                "title": "AAPL Stock Analysis",
-                "url": "https://example.com/aapl-analysis",
-                "content": "Analysts raise price target on strong iPhone sales.",
-            },
-        ]
-    }
-
-    with patch("chat.urlopen") as mock_urlopen:
-        mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps(mock_json).encode()
-        mock_response.getheader.return_value = "application/json"
-        mock_urlopen.return_value.__enter__.return_value = mock_response
+def test_web_search_calls_mcp():
+    """Verify web_search delegates to MCP client searxng_search tool."""
+    with patch("chat._MCPClient.get") as mock_mcp_get:
+        mock_client = MagicMock()
+        mock_client.call_tool.return_value = "Search Results for \"AAPL\"\n1. AAPL Earnings Beat"
+        mock_mcp_get.return_value = mock_client
 
         result = _web_search("AAPL earnings")
 
+    mock_client.call_tool.assert_called_once_with("searxng_search", {"query": "AAPL earnings"})
     assert "AAPL Earnings Beat" in result
-    assert "AAPL Stock Analysis" in result
-    assert "example.com/aapl-earnings" in result
 
 
-def test_web_search_handles_error():
-    """Verify web_search returns error message when urlopen raises an exception."""
-    with patch("chat.urlopen", side_effect=Exception("Connection refused")):
-        result = _web_search("AAPL")
-
-    assert result.startswith("Search failed:")
-    assert "Connection refused" in result
-
-
-def test_web_search_handles_empty_results():
-    """Verify web_search returns 'No results found.' when results list is empty."""
-    mock_json = {"results": []}
-
-    with patch("chat.urlopen") as mock_urlopen:
-        mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps(mock_json).encode()
-        mock_urlopen.return_value.__enter__.return_value = mock_response
+def test_web_search_handles_mcp_error():
+    """Verify web_search returns error message when MCP call fails."""
+    with patch("chat._MCPClient.get") as mock_mcp_get:
+        mock_client = MagicMock()
+        mock_client.call_tool.return_value = "MCP call failed: Connection refused"
+        mock_mcp_get.return_value = mock_client
 
         result = _web_search("AAPL")
 
-    assert result == "No results found."
+    assert "MCP call failed" in result
 
 
-def test_web_search_truncates_long_content():
-    """Verify web_search truncates content over 300 chars and appends ellipsis."""
-    long_content = "x" * 350
-    mock_json = {
-        "results": [
-            {
-                "title": "Long Article",
-                "url": "https://example.com/long",
-                "content": long_content,
-            }
-        ]
-    }
+def test_web_scrape_calls_mcp():
+    """Verify web_scrape delegates to MCP client web_scrape tool."""
+    with patch("chat._MCPClient.get") as mock_mcp_get:
+        mock_client = MagicMock()
+        mock_client.call_tool.return_value = "Title: Test Article\n\nThis is the article content."
+        mock_mcp_get.return_value = mock_client
 
-    with patch("chat.urlopen") as mock_urlopen:
-        mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps(mock_json).encode()
-        mock_urlopen.return_value.__enter__.return_value = mock_response
+        result = _web_scrape("https://example.com/article")
 
-        result = _web_search("AAPL")
+    mock_client.call_tool.assert_called_once_with("web_scrape", {"url": "https://example.com/article"})
+    assert "Test Article" in result
 
-    assert "xxx..." in result
-    assert "x" * 350 not in result
+
+def test_web_scrape_handles_mcp_error():
+    """Verify web_scrape returns error message when MCP call fails."""
+    with patch("chat._MCPClient.get") as mock_mcp_get:
+        mock_client = MagicMock()
+        mock_client.call_tool.return_value = "MCP call failed: Timeout"
+        mock_mcp_get.return_value = mock_client
+
+        result = _web_scrape("https://example.com/slow")
+
+    assert "MCP call failed" in result
 
 
 def test_build_system_prompt_followup_mode():
     """Verify system prompt includes articles and summary in follow-up mode."""
-    from chat import _build_system_prompt
-
     articles = [
         {"title": "AAPL Earnings Beat", "source": "Reuters", "date": "2026-07-01", "snippet": "Strong Q2 results."},
     ]
@@ -101,19 +72,19 @@ def test_build_system_prompt_followup_mode():
     assert "AAPL" in prompt
     assert "Apple shows strong earnings" in prompt
     assert "AAPL Earnings Beat" in prompt
-    assert "web_search" in prompt
+    assert "searxng_search" in prompt
+    assert "web_scrape" in prompt
 
 
 def test_build_system_prompt_standalone_mode():
     """Verify system prompt omits article context in standalone mode."""
-    from chat import _build_system_prompt
-
     prompt = _build_system_prompt("TSLA", None, None)
 
     assert "TSLA" in prompt
     assert "INITIAL SUMMARY" not in prompt
     assert "ARTICLES" not in prompt
-    assert "web_search" in prompt
+    assert "searxng_search" in prompt
+    assert "web_scrape" in prompt
 
 
 def test_ask_followup_returns_text_response():
@@ -146,19 +117,20 @@ def test_ask_followup_returns_text_response():
     # Verify LLM was called with tools parameter
     call_kwargs = mock_client.chat.completions.create.call_args.kwargs
     assert "tools" in call_kwargs
-    assert len(call_kwargs["tools"]) == 1
-    assert call_kwargs["tools"][0]["function"]["name"] == "web_search"
+    tool_names = [t["function"]["name"] for t in call_kwargs["tools"]]
+    assert "searxng_search" in tool_names
+    assert "web_scrape" in tool_names
 
 
 def test_ask_followup_executes_tool_calls():
-    """Verify ask_followup executes web_search tool calls and loops back."""
+    """Verify ask_followup executes searxng_search tool calls and loops back."""
     from chat import ask_followup
 
-    # First call: LLM requests web search
+    # First call: LLM requests web search via MCP
     mock_tool_call = MagicMock()
     mock_tool_call.id = "call_123"
     mock_tool_call.type = "function"
-    mock_tool_call.function.name = "web_search"
+    mock_tool_call.function.name = "searxng_search"
     mock_tool_call.function.arguments = '{"query": "AAPL latest news"}'
 
     mock_response_tool = MagicMock()
@@ -174,7 +146,7 @@ def test_ask_followup_executes_tool_calls():
     mock_client.chat.completions.create.side_effect = [mock_response_tool, mock_response_text]
 
     with patch("chat.OpenAI", return_value=mock_client):
-        with patch("chat._web_search", return_value="[1] AAPL New Product Launch\n    URL: https://example.com\n    Apple announces new lineup.") as mock_search:
+        with patch("chat._web_search", return_value="Search Results for \"AAPL latest news\"\n1. AAPL New Product Launch") as mock_search:
             result = ask_followup(
                 question="What's new with AAPL?",
                 ticker="AAPL",
@@ -187,6 +159,45 @@ def test_ask_followup_executes_tool_calls():
     assert mock_client.chat.completions.create.call_count == 2
     assert "new products" in result["answer"]
     mock_search.assert_called_once_with("AAPL latest news")
+
+
+def test_ask_followup_executes_web_scrape_tool_calls():
+    """Verify ask_followup executes web_scrape tool calls and loops back."""
+    from chat import ask_followup
+
+    # First call: LLM requests web scrape
+    mock_tool_call = MagicMock()
+    mock_tool_call.id = "call_456"
+    mock_tool_call.type = "function"
+    mock_tool_call.function.name = "web_scrape"
+    mock_tool_call.function.arguments = '{"url": "https://example.com/article"}'
+
+    mock_response_tool = MagicMock()
+    mock_response_tool.choices[0].message.content = None
+    mock_response_tool.choices[0].message.tool_calls = [mock_tool_call]
+
+    # Second call: LLM returns text answer after seeing scraped content
+    mock_response_text = MagicMock()
+    mock_response_text.choices[0].message.content = "Based on the article, AAPL has strong fundamentals."
+    mock_response_text.choices[0].message.tool_calls = None
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.side_effect = [mock_response_tool, mock_response_text]
+
+    with patch("chat.OpenAI", return_value=mock_client):
+        with patch("chat._web_scrape", return_value="Title: AAPL Analysis\n\nStrong fundamentals reported.") as mock_scrape:
+            result = ask_followup(
+                question="What does the article say?",
+                ticker="AAPL",
+                history=[],
+                llm_url="http://localhost:8080/v1",
+                model="qwen",
+            )
+
+    # Verify LLM was called twice (tool call + final answer)
+    assert mock_client.chat.completions.create.call_count == 2
+    assert "strong fundamentals" in result["answer"]
+    mock_scrape.assert_called_once_with("https://example.com/article")
 
 
 def test_ask_followup_rejects_empty_question():
@@ -228,7 +239,7 @@ def test_ask_followup_handles_max_iterations():
     mock_tool_call = MagicMock()
     mock_tool_call.id = "call_123"
     mock_tool_call.type = "function"
-    mock_tool_call.function.name = "web_search"
+    mock_tool_call.function.name = "searxng_search"
     mock_tool_call.function.arguments = '{"query": "test"}'
 
     mock_response = MagicMock()
@@ -248,5 +259,6 @@ def test_ask_followup_handles_max_iterations():
                 model="qwen",
             )
 
-    # Should have been called exactly MAX_SEARCH_ITERATIONS + 1 times (loop + final call)
+    # Should have made MAX_SEARCH_ITERATIONS tool calls + 1 final call without tools
     assert mock_client.chat.completions.create.call_count == MAX_SEARCH_ITERATIONS + 1
+    assert result["answer"] != ""

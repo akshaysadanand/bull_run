@@ -472,142 +472,69 @@ if ticker:
         elif msg["role"] == "assistant":
             st.markdown(f"**Assistant:** {msg['content']}")
 
-    # Streaming: process pending question
+    # Process pending question (non-streaming)
     if st.session_state.chat_pending:
         import re
-        from chat import ask_followup_stream
+        from chat import ask_followup
 
         pending = st.session_state.chat_pending
 
         # Show user's question immediately
         st.markdown(f"**You:** {pending['question']}")
 
-        result = ask_followup_stream(
-            question=pending["question"],
-            ticker=pending["ticker"],
-            history=pending["history"],
-            llm_url=pending["llm_url"],
-            model=pending["model"],
-            articles=pending["articles"],
-            summary=pending["summary"],
-        )
+        # Show research status while processing
+        with st.status("🔍 Researching...", expanded=False) as status:
+            result = ask_followup(
+                question=pending["question"],
+                ticker=pending["ticker"],
+                history=pending["history"],
+                llm_url=pending["llm_url"],
+                model=pending["model"],
+                articles=pending["articles"],
+                summary=pending["summary"],
+            )
 
-        # Show tool call progress
-        if result["tool_calls"]:
-            with st.status("🔍 Researching...", expanded=False) as status:
+            # Show tool calls made during research
+            if result["tool_calls"]:
+                status.markdown("**Tool calls made:**")
                 for i, tc in enumerate(result["tool_calls"], 1):
                     tool = tc.get("tool", "unknown")
                     if tool == "searxng_search":
-                        status.markdown(f"**{i}. 🔎 web_search** — `{tc.get('query', '')}`")
+                        status.markdown(f"{i}. 🔎 web_search — `{tc.get('query', '')}`")
                     elif tool == "web_scrape":
                         url = tc.get("url", "")
-                        # Shorten long URLs for display
                         display_url = url[:80] + "..." if len(url) > 80 else url
-                        status.markdown(f"**{i}. 📄 web_scrape** — `{display_url}`")
+                        status.markdown(f"{i}. 📄 web_scrape — `{display_url}`")
                     else:
-                        status.markdown(f"**{i}. {tool}**")
-            st.session_state.chat_tool_calls = result["tool_calls"]
+                        status.markdown(f"{i}. {tool}")
+        st.session_state.chat_tool_calls = result["tool_calls"]
 
-        # Stream response, separating thinking tags from answer in real-time
-        with st.container():
-            st.markdown("**Assistant:**")
-
-        # Placeholders for real-time updates
-        thinking_placeholder = st.empty()
-        answer_placeholder = st.empty()
-
-        # Accumulate raw text, tracking thinking vs answer
-        full_raw = ""
-        in_thinking = False
-        thinking_buffer = ""
-        answer_text = ""
-        thinking_tag_pattern = re.compile(
-            r'(</?thinking>|<think>|</think>)', re.IGNORECASE
-        )
-
-        stream_error = None
-        try:
-            for chunk in result["stream"]:
-                full_raw += chunk
-
-                # Find thinking tag boundaries in the new chunk portion
-                pos = 0
-                for match in thinking_tag_pattern.finditer(chunk):
-                    tag = match.group(0)
-                    before = chunk[pos:match.start()]
-
-                    if in_thinking:
-                        thinking_buffer += before
-                    else:
-                        answer_text += before
-
-                    # Check what tag we hit
-                    if re.match(r'</?thinking>', tag, re.IGNORECASE):
-                        if re.match(r'</', tag):
-                            in_thinking = False
-                        else:
-                            in_thinking = True
-                    elif tag == '</think>':
-                        in_thinking = False
-                    elif tag == '</think>':
-                        in_thinking = True
-
-                    pos = match.end()
-
-                # Remaining text after last tag
-                remaining = chunk[pos:]
-                if in_thinking:
-                    thinking_buffer += remaining
-                else:
-                    answer_text += remaining
-
-                # Update UI in real-time using plain text to avoid broken markdown
-                # Markdown will be rendered properly on the final pass below
-                display_parts = []
-                if thinking_buffer.strip():
-                    display_parts.append(f"_🧠 Thinking..._")
-                if answer_text.strip():
-                    display_parts.append(answer_text.strip())
-                if display_parts:
-                    # Use plain text display during streaming — markdown breaks
-                    # when bold/italic markers are split across word boundaries
-                    answer_placeholder.markdown(
-                        f"<pre style='white-space:pre-wrap;font-family:inherit'>"
-                        + html.escape(" ".join(display_parts))
-                        + "</pre>"
-                    )
-        except Exception as e:
-            import logging
-            stream_logger = logging.getLogger(__name__)
-            stream_logger.exception("Streaming failed mid-response")
-            stream_error = str(e)
-
-        # Final cleanup — strip any unclosed thinking tags
-        full_answer = re.sub(r'<think>.*?</think>', '', full_raw, flags=re.DOTALL | re.IGNORECASE)
+        # Strip thinking tags from answer
+        full_answer = result["answer"] or ""
+        thinking = ""
+        # Extract thinking content before stripping
+        for pattern in [r'<think>(.*?)</think>', r'<thinking>(.*?)</thinking>']:
+            matches = re.findall(pattern, full_answer, re.DOTALL | re.IGNORECASE)
+            if matches:
+                thinking = "\n".join(m.strip() for m in matches).strip()
+                break
+        # Clean answer — strip thinking tags
+        full_answer = re.sub(r'<think>.*?</think>', '', full_answer, flags=re.DOTALL | re.IGNORECASE)
         full_answer = re.sub(r'<thinking>.*?</thinking>', '', full_answer, flags=re.DOTALL | re.IGNORECASE)
         full_answer = re.sub(r'\s*<think>.*$', '', full_answer, flags=re.DOTALL | re.IGNORECASE)
         full_answer = full_answer.strip()
 
-        # Final render of thinking (collapsed) and clean answer
-        thinking = thinking_buffer.strip()
-        if thinking:
-            with thinking_placeholder.container():
-                with st.expander("🧠 Model's Reasoning Process"):
-                    st.markdown(thinking)
-        else:
-            thinking_placeholder.empty()
-
-        # Clear streaming placeholder then render final answer as proper markdown
-        answer_placeholder.empty()
+        # Render answer as proper markdown
+        st.markdown("**Assistant:**")
         if full_answer:
-            with st.container():
-                st.markdown(full_answer)
+            st.markdown(full_answer)
 
-        # Show warning if streaming was interrupted (partial response)
-        if stream_error:
-            st.warning(f"⚠️ Streaming was interrupted ({stream_error}). Showing partial response.")
+        # Show thinking in collapsible expander if present
+        if thinking:
+            with st.expander("🧠 Model's Reasoning Process"):
+                st.markdown(thinking)
 
-        # Save to history after streaming completes (clean text only)
+        # Save to history
         st.session_state.chat_history = pending["history"] + [
             {"role": "user", "content": pending["question"]},
             {"role": "assistant", "content": full_answer},

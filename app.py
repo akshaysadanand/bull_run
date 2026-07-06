@@ -498,20 +498,16 @@ if ticker:
                     status.markdown(f"**{i}. web_search** — `{tc.get('query', '')}`")
             st.session_state.chat_tool_calls = result["tool_calls"]
 
-        # Stream the response (strip thinking tags for display)
-        def _strip_thinking(text):
-            text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE)
-            text = re.sub(r'<thinking>.*?</thinking>', '', text, flags=re.DOTALL | re.IGNORECASE)
-            text = re.sub(r'\s*<think>.*$', '', text, flags=re.DOTALL | re.IGNORECASE)
-            return text.strip()
-
-        def _clean_stream(raw_stream):
-            for chunk in raw_stream:
-                yield _strip_thinking(chunk)
-
+        # Stream raw response, then clean thinking tags after streaming completes
         with st.container():
             st.markdown("**Assistant:**")
-            full_answer = st.write_stream(_clean_stream(result["stream"]))
+            full_raw = st.write_stream(result["stream"])
+
+        # Strip thinking tags from the full response (after streaming, not per-chunk)
+        full_answer = re.sub(r'<think>.*?</think>', '', full_raw, flags=re.DOTALL | re.IGNORECASE)
+        full_answer = re.sub(r'<thinking>.*?</thinking>', '', full_answer, flags=re.DOTALL | re.IGNORECASE)
+        full_answer = re.sub(r'\s*<think>.*$', '', full_answer, flags=re.DOTALL | re.IGNORECASE)
+        full_answer = full_answer.strip()
 
         # Show thinking in dropdown if available
         thinking = getattr(ask_followup_stream, "_thinking", "")

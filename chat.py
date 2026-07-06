@@ -33,8 +33,9 @@ def _strip_tool_call_xml(text: str) -> str:
     return text.strip()
 
 MCP_SERVER_DIR = Path.home() / "Projects" / "web-search-MCP"
-MAX_SEARCH_ITERATIONS = 5
+MAX_SEARCH_ITERATIONS = 3
 MAX_CHAT_TURNS = 10
+MAX_SEARCHES = 5  # Hard cap on searxng_search calls per question
 
 # LLM tool definitions - names match the MCP server's tool names
 WEB_SEARCH_TOOL = {
@@ -232,14 +233,15 @@ def _build_system_prompt(
     year_hint = f"Today's year is {CURRENT_YEAR}. When searching for upcoming events, earnings, or catalysts, " \
                 f"use queries that target {CURRENT_YEAR} and {CURRENT_YEAR + 1}."
     tool_instructions = (
-        "\n\nRESEARCH WORKFLOW (follow these steps):\n"
-        "1. Use searxng_search to find relevant URLs for the user's question.\n"
-        "2. From the search results, identify the most relevant URLs (articles, forum posts, press releases).\n"
-        "3. Use web_scrape to read the full content of those URLs — do NOT skip this step.\n"
-        "4. Synthesize your answer from the scraped content, not just from search snippets.\n\n"
-        "IMPORTANT: Search results only contain short snippets. You MUST use web_scrape on promising URLs "
-        "to get the full article content before forming your answer. Never answer based solely on search "
-        "snippets — always scrape at least 2-3 relevant pages."
+        "\n\nRESEARCH WORKFLOW (strict — follow in order):\n"
+        "1. Do 1-3 searxng_search calls to find relevant URLs. Do NOT exceed 5 searches total.\n"
+        "2. Use web_scrape on 2-3 of the most relevant URLs from your search results.\n"
+        "3. Synthesize your answer from the scraped content, not from search snippets.\n\n"
+        "CRITICAL RULES:\n"
+        "- Search results only contain short snippets with URLs. You MUST use web_scrape to read full content.\n"
+        "- Never answer based solely on search snippets — always scrape at least 2-3 relevant pages first.\n"
+        "- If you have already done several searches, STOP searching and start scraping the URLs you found.\n"
+        "- Do NOT issue more than 5 searxng_search calls total. After that, only use web_scrape."
     )
     if articles and summary:
         articles_text = "\n".join(
@@ -268,11 +270,12 @@ def _build_system_prompt(
         )
 
 
-def _execute_tool_call(tool_call) -> tuple[str, str]:
+def _execute_tool_call(tool_call, search_count: list[int]) -> tuple[str, str]:
     """Execute an LLM tool call and return (tool_name, result_text).
 
     Args:
         tool_call: The tool call object from the LLM response.
+        search_count: Mutable list with single int tracking total searches (allows mutation in closure).
 
     Returns:
         Tuple of (tool_name, result_text).
@@ -284,6 +287,14 @@ def _execute_tool_call(tool_call) -> tuple[str, str]:
         query = args.get("query", "").strip()
         if not query:
             return ("searxng_search", "Error: query parameter is required and cannot be empty.")
+        search_count[0] += 1
+        if search_count[0] > MAX_SEARCHES:
+            return (
+                "searxng_search",
+                f"Search limit reached ({MAX_SEARCHES}/{MAX_SEARCHES}). "
+                "STOP searching. Use web_scrape to read the full content of URLs from your previous "
+                "search results instead. Do not issue any more searxng_search calls."
+            )
         return ("searxng_search", _web_search(query))
     elif name == "web_scrape":
         url = args.get("url", "").strip()
@@ -323,6 +334,9 @@ def ask_followup(
 
     # Reset tool calls tracking for this invocation
     ask_followup._tool_calls = []
+
+    # Track search count to enforce MAX_SEARCHES limit
+    search_count = [0]
 
     client = OpenAI(base_url=llm_url, api_key="not-needed", timeout=120.0)
     system_prompt = _build_system_prompt(ticker, articles, summary)
@@ -389,7 +403,7 @@ def ask_followup(
 
             # Then append tool results
             for tool_call in message.tool_calls:
-                tool_name, result = _execute_tool_call(tool_call)
+                tool_name, result = _execute_tool_call(tool_call, search_count)
 
                 # Build display info based on tool type
                 args = json.loads(tool_call.function.arguments)
@@ -419,10 +433,29 @@ def ask_followup(
             if not hasattr(ask_followup, "_tool_calls"):
                 ask_followup._tool_calls = []
             ask_followup._tool_calls.extend(tool_call_info)
+
+            # Enforce search -> scrape pattern: if this iteration was all searches and we've
+            # already done searches before, inject a corrective reminder forcing web_scrape.
+            tool_names_this_iter = [d["tool"] for d in tool_call_info]
+            if (
+                all(t == "searxng_search" for t in tool_names_this_iter)
+                and search_count[0] >= 2
+            ):
+                reminder = (
+                    "\u26a0 REMINDER: You already have search results with URLs. "
+                    "STOP searching and use web_scrape to read the full content of at least "
+                    "2-3 of the most relevant URLs from your search results. "
+                    "Do not issue any more searxng_search calls until you have scraped content."
+                )
+                messages.append({
+                    "role": "user",
+                    "content": reminder,
+                })
+
             continue  # Loop back to call LLM again with tool results
 
         # Text response - done
-        answer = message.content or ""
+        answer = _strip_tool_call_xml(message.content or "")
         new_history = trimmed_history + [
             {"role": "user", "content": question},
             {"role": "assistant", "content": answer},
@@ -440,7 +473,7 @@ def ask_followup(
             messages=messages,
             temperature=0.1,
         )
-        answer = final_response.choices[0].message.content or "Search limit reached."
+        answer = _strip_tool_call_xml(final_response.choices[0].message.content or "Search limit reached.")
     except Exception:
         answer = "Search limit reached. I'll provide my best answer with the information I have."
 

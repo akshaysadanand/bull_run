@@ -187,3 +187,66 @@ def test_ask_followup_executes_tool_calls():
     assert mock_client.chat.completions.create.call_count == 2
     assert "new products" in result["answer"]
     mock_search.assert_called_once_with("AAPL latest news")
+
+
+def test_ask_followup_rejects_empty_question():
+    """Verify ask_followup returns early on empty question."""
+    from chat import ask_followup
+
+    result = ask_followup(
+        question="",
+        ticker="AAPL",
+        history=[],
+        llm_url="http://localhost:8080/v1",
+        model="qwen",
+    )
+
+    assert result["answer"] == ""
+    assert result["history"] == []
+
+
+def test_ask_followup_rejects_whitespace_question():
+    """Verify ask_followup returns early on whitespace-only question."""
+    from chat import ask_followup
+
+    result = ask_followup(
+        question="   ",
+        ticker="AAPL",
+        history=[],
+        llm_url="http://localhost:8080/v1",
+        model="qwen",
+    )
+
+    assert result["answer"] == ""
+
+
+def test_ask_followup_handles_max_iterations():
+    """Verify ask_followup stops after MAX_SEARCH_ITERATIONS tool calls."""
+    from chat import ask_followup, MAX_SEARCH_ITERATIONS
+
+    # LLM keeps requesting searches every time
+    mock_tool_call = MagicMock()
+    mock_tool_call.id = "call_123"
+    mock_tool_call.type = "function"
+    mock_tool_call.function.name = "web_search"
+    mock_tool_call.function.arguments = '{"query": "test"}'
+
+    mock_response = MagicMock()
+    mock_response.choices[0].message.content = None
+    mock_response.choices[0].message.tool_calls = [mock_tool_call]
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.return_value = mock_response
+
+    with patch("chat.OpenAI", return_value=mock_client):
+        with patch("chat._web_search", return_value="Search results"):
+            result = ask_followup(
+                question="Test question",
+                ticker="AAPL",
+                history=[],
+                llm_url="http://localhost:8080/v1",
+                model="qwen",
+            )
+
+    # Should have been called exactly MAX_SEARCH_ITERATIONS + 1 times (loop + final call)
+    assert mock_client.chat.completions.create.call_count == MAX_SEARCH_ITERATIONS + 1

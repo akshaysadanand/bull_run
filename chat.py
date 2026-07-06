@@ -329,10 +329,11 @@ def ask_followup_stream(
                     temperature=0.1,
                 )
             except Exception as e2:
-                def error_gen():
-                    yield f"LLM error: {e2}"
-                ask_followup_stream._error = str(e2)
-                return {"stream": error_gen(), "tool_calls": ask_followup_stream._tool_calls, "error": str(e2)}
+                error_msg = str(e2)
+                def error_gen(msg=error_msg):
+                    yield f"LLM error: {msg}"
+                ask_followup_stream._error = error_msg
+                return {"stream": error_gen(), "tool_calls": ask_followup_stream._tool_calls, "error": error_msg}
 
         message = response.choices[0].message
 

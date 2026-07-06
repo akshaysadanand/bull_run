@@ -76,6 +76,8 @@ if "_preset_urls_raw" not in st.session_state:
     st.session_state._preset_urls_raw = None
 if "_last_ticker" not in st.session_state:
     st.session_state._last_ticker = "AAPL"
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
 
 st.title("🐂 Bull Run — Stock News Aggregator")
 
@@ -214,6 +216,7 @@ def on_get_news():
     st.session_state.custom_summary = None
     st.session_state.custom_thinking = None
     st.session_state.custom_summary_error = None
+    st.session_state.chat_history = []
     st.session_state.progress_step = 1
     st.session_state.progress_messages = []
     st.session_state.progress_done = False
@@ -314,6 +317,40 @@ def _render_summary(summary, summary_error, thinking, llm_url, model):
                 st.markdown(thinking)
     else:
         st.info("Waiting for results...")
+
+
+def on_chat_send():
+    """Callback for chat send button — processes question and updates history."""
+    question = st.session_state.get("chat_input", "").strip()
+    if not question:
+        return
+
+    articles = st.session_state.articles or []
+    custom_articles = st.session_state.custom_articles or []
+    all_articles = articles + custom_articles
+    summary = st.session_state.summary or None
+
+    # Combine Yahoo and custom summaries if both exist
+    if st.session_state.custom_summary:
+        combined_summary = (summary or "") + "\n\n" + (st.session_state.custom_summary or "")
+        summary = combined_summary.strip() or None
+
+    from chat import ask_followup
+
+    result = ask_followup(
+        question=question,
+        ticker=ticker,
+        history=st.session_state.chat_history,
+        llm_url=llm_url,
+        model=model,
+        articles=all_articles if all_articles else None,
+        summary=summary,
+    )
+
+    if result["answer"]:
+        st.session_state.chat_history = result["history"]
+        st.session_state.chat_input = ""
+        st.rerun()
 
 
 # --- Main Panel ---
@@ -418,6 +455,32 @@ else:
                 )
 
     st.caption("News sourced from Yahoo Finance · Summarized by your local LLM")
+
+# --- Chat Section ---
+st.divider()
+st.header("💬 Ask about " + (ticker if ticker else "..."))
+
+if ticker:
+    # Render chat history
+    for msg in st.session_state.chat_history:
+        if msg["role"] == "user":
+            st.markdown(f"**You:** {msg['content']}")
+        elif msg["role"] == "assistant":
+            st.markdown(f"**Assistant:** {msg['content']}")
+
+    # Chat input
+    cols = st.columns([5, 1])
+    with cols[0]:
+        st.text_input(
+            "Ask a follow-up question",
+            key="chat_input",
+            placeholder="e.g., What about regulatory risks? Summarize only earnings-related articles.",
+            disabled=not ticker,
+        )
+    with cols[1]:
+        st.button("Send", type="primary", use_container_width=True, on_click=on_chat_send)
+else:
+    st.info("Enter a ticker to start chatting.")
 
 # ── Run next progress step (after UI renders, triggers rerun) ──
 if st.session_state.progress_step is not None:

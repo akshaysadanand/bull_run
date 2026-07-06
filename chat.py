@@ -259,3 +259,147 @@ def ask_followup(
         "history": new_history,
         "tool_calls": ask_followup._tool_calls,
     }
+
+
+def ask_followup_stream(
+    question: str,
+    ticker: str,
+    history: list[dict],
+    llm_url: str,
+    model: str,
+    articles: Optional[list[dict]] = None,
+    summary: Optional[str] = None,
+) -> dict:
+    """Process a follow-up question with streaming LLM response.
+
+    Runs the tool-calling loop synchronously, then streams the final LLM
+    response token-by-token. Returns a dict with 'tool_calls' (populated
+    as searches run) and 'stream' (a generator yielding text chunks).
+
+    Args:
+        question: User's question.
+        ticker: Stock ticker symbol.
+        history: Prior chat messages [{role, content}, ...].
+        llm_url: OpenAI-compatible LLM base URL.
+        model: Model name.
+        articles: Optional scraped articles for context.
+        summary: Optional initial summary for context.
+
+    Returns:
+        Dict with 'stream' (generator yielding text chunks),
+        'tool_calls' (list of {tool, query, result} dicts),
+        and 'error' (set if an error occurred).
+    """
+    if not question.strip():
+        def empty_gen():
+            return iter([])
+        return {"stream": empty_gen(), "tool_calls": [], "error": None}
+
+    # Reset tool calls tracking
+    ask_followup_stream._tool_calls = []
+    ask_followup_stream._error = None
+
+    client = OpenAI(base_url=llm_url, api_key="not-needed")
+    system_prompt = _build_system_prompt(ticker, articles, summary)
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+    ]
+
+    # Trim history to last MAX_CHAT_TURNS turns if needed
+    trimmed_history = history[-(MAX_CHAT_TURNS * 2):] if len(history) > MAX_CHAT_TURNS * 2 else history
+    messages.extend(trimmed_history)
+    messages.append({"role": "user", "content": question})
+
+    # Tool-calling loop (max MAX_SEARCH_ITERATIONS iterations)
+    for _ in range(MAX_SEARCH_ITERATIONS):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=[WEB_SEARCH_TOOL],
+                temperature=0.1,
+            )
+        except Exception as e:
+            logger.exception("LLM call failed, falling back to text-only")
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=0.1,
+                )
+            except Exception as e2:
+                def error_gen():
+                    yield f"LLM error: {e2}"
+                ask_followup_stream._error = str(e2)
+                return {"stream": error_gen(), "tool_calls": ask_followup_stream._tool_calls, "error": str(e2)}
+
+        message = response.choices[0].message
+
+        if message.tool_calls:
+            tool_call_info = []
+            messages.append({
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": tc.type,
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        }
+                    }
+                    for tc in message.tool_calls
+                ],
+            })
+
+            for tool_call in message.tool_calls:
+                if tool_call.function.name == "web_search":
+                    args = json.loads(tool_call.function.arguments)
+                    query = args.get("query", "")
+                    search_result = _web_search(query)
+                    tool_call_info.append({
+                        "tool": "web_search",
+                        "query": query,
+                        "result": search_result,
+                    })
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": search_result,
+                    })
+
+            ask_followup_stream._tool_calls.extend(tool_call_info)
+            continue
+
+        # Text response (no tool calls) — stream it instead
+        def text_stream():
+            yield (message.content or "")
+        return {
+            "stream": text_stream(),
+            "tool_calls": ask_followup_stream._tool_calls,
+            "error": None,
+        }
+
+    # Exceeded max iterations — stream final LLM call
+    def final_stream():
+        try:
+            stream = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.1,
+                stream=True,
+            )
+            for chunk in stream:
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    yield delta
+        except Exception as e:
+            logger.exception("Streaming failed")
+            yield f"Streaming error: {e}"
+
+    return {
+        "stream": final_stream(),
+        "tool_calls": ask_followup_stream._tool_calls,
+        "error": None,
+    }

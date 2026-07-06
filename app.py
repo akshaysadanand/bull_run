@@ -80,6 +80,8 @@ if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 if "chat_tool_calls" not in st.session_state:
     st.session_state.chat_tool_calls = []
+if "chat_pending" not in st.session_state:
+    st.session_state.chat_pending = None
 
 st.title("🐂 Bull Run — Stock News Aggregator")
 
@@ -220,6 +222,7 @@ def on_get_news():
     st.session_state.custom_summary_error = None
     st.session_state.chat_history = []
     st.session_state.chat_tool_calls = []
+    st.session_state.chat_pending = None
     st.session_state.progress_step = 1
     st.session_state.progress_messages = []
     st.session_state.progress_done = False
@@ -323,7 +326,7 @@ def _render_summary(summary, summary_error, thinking, llm_url, model):
 
 
 def on_chat_send():
-    """Callback for chat send (triggered by Enter key) — processes question and updates history."""
+    """Callback for chat send (triggered by Enter key) — stores question as pending for streaming."""
     question = st.session_state.get("chat_input", "").strip()
     if not question:
         return
@@ -338,23 +341,19 @@ def on_chat_send():
         combined_summary = (summary or "") + "\n\n" + (st.session_state.custom_summary or "")
         summary = combined_summary.strip() or None
 
-    from chat import ask_followup
-
-    result = ask_followup(
-        question=question,
-        ticker=ticker,
-        history=st.session_state.chat_history,
-        llm_url=llm_url,
-        model=model,
-        articles=all_articles if all_articles else None,
-        summary=summary,
-    )
-
-    if result["answer"]:
-        st.session_state.chat_history = result["history"]
-        st.session_state.chat_tool_calls = result.get("tool_calls", [])
-        st.session_state.chat_input = ""
-        st.rerun()
+    # Store pending question with all context for streaming phase
+    st.session_state.chat_pending = {
+        "question": question,
+        "ticker": ticker,
+        "history": st.session_state.chat_history,
+        "llm_url": llm_url,
+        "model": model,
+        "articles": all_articles if all_articles else None,
+        "summary": summary,
+    }
+    st.session_state.chat_tool_calls = []
+    st.session_state.chat_input = ""
+    st.rerun()
 
 
 # --- Main Panel ---
@@ -472,22 +471,57 @@ if ticker:
         elif msg["role"] == "assistant":
             st.markdown(f"**Assistant:** {msg['content']}")
 
-    # Render tool calls from last response (if any)
-    if st.session_state.chat_tool_calls:
+    # Streaming: process pending question
+    if st.session_state.chat_pending:
+        from chat import ask_followup_stream
+
+        pending = st.session_state.chat_pending
+        result = ask_followup_stream(
+            question=pending["question"],
+            ticker=pending["ticker"],
+            history=pending["history"],
+            llm_url=pending["llm_url"],
+            model=pending["model"],
+            articles=pending["articles"],
+            summary=pending["summary"],
+        )
+
+        # Show tool call progress
+        if result["tool_calls"]:
+            with st.status("🔍 Searching...", expanded=False) as status:
+                for i, tc in enumerate(result["tool_calls"], 1):
+                    status.markdown(f"**{i}. web_search** — `{tc.get('query', '')}`")
+            st.session_state.chat_tool_calls = result["tool_calls"]
+
+        # Stream the response
+        with st.container():
+            st.markdown("**Assistant:**")
+            full_answer = st.write_stream(result["stream"])
+
+        # Save to history after streaming completes
+        st.session_state.chat_history = pending["history"] + [
+            {"role": "user", "content": pending["question"]},
+            {"role": "assistant", "content": full_answer},
+        ]
+        st.session_state.chat_pending = None
+
+    # Render tool calls from last response (if any, and not currently streaming)
+    elif st.session_state.chat_tool_calls:
         with st.expander("🔧 Tool Calls Made", expanded=False):
             for i, tc in enumerate(st.session_state.chat_tool_calls, 1):
                 st.markdown(f"**{i}. web_search** — `{tc.get('query', '')}`")
-                result = tc.get("result", "")
-                if result:
+                tc_result = tc.get("result", "")
+                if tc_result:
                     with st.expander("Result"):
-                        st.markdown(result)
+                        st.markdown(tc_result)
 
     # Chat input (Enter to send)
+    is_chatting = st.session_state.chat_pending is not None
     st.text_input(
         "Ask a follow-up question",
         key="chat_input",
         placeholder="e.g., What about regulatory risks? Summarize only earnings-related articles.",
-        disabled=not ticker,
+        disabled=not ticker or is_chatting,
         on_change=on_chat_send,
     )
 else:

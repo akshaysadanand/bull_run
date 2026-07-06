@@ -35,7 +35,6 @@ def _strip_tool_call_xml(text: str) -> str:
 MCP_SERVER_DIR = Path.home() / "Projects" / "web-search-MCP"
 MAX_SEARCH_ITERATIONS = 3
 MAX_CHAT_TURNS = 10
-MAX_RESPONSE_TOKENS = 4096
 
 # LLM tool definitions - names match the MCP server's tool names
 WEB_SEARCH_TOOL = {
@@ -330,7 +329,6 @@ def ask_followup(
                 messages=messages,
                 tools=TOOLS,
                 temperature=0.1,
-                max_tokens=MAX_RESPONSE_TOKENS,
             )
         except Exception as e:
             logger.exception("LLM call failed, falling back to text-only")
@@ -340,7 +338,6 @@ def ask_followup(
                     model=model,
                     messages=messages,
                     temperature=0.1,
-                    max_tokens=MAX_RESPONSE_TOKENS,
                 )
             except Exception as e2:
                 error_answer = f"LLM error: {e2}"
@@ -424,7 +421,6 @@ def ask_followup(
             model=model,
             messages=messages,
             temperature=0.1,
-            max_tokens=MAX_RESPONSE_TOKENS,
         )
         answer = final_response.choices[0].message.content or "Search limit reached."
     except Exception:
@@ -499,7 +495,6 @@ def ask_followup_stream(
                 messages=messages,
                 tools=TOOLS,
                 temperature=0.1,
-                max_tokens=MAX_RESPONSE_TOKENS,
                 stream=True,
             )
         except Exception as e:
@@ -510,7 +505,6 @@ def ask_followup_stream(
                     messages=messages,
                     tools=TOOLS,
                     temperature=0.1,
-                    max_tokens=MAX_RESPONSE_TOKENS,
                 )
                 message = response.choices[0].message
                 if message.tool_calls:
@@ -652,7 +646,6 @@ def ask_followup_stream(
             model=model,
             messages=messages,
             temperature=0.1,
-            max_tokens=MAX_RESPONSE_TOKENS,
         )
         content = _strip_tool_call_xml(response.choices[0].message.content or "Search limit reached.")
     except Exception as e:

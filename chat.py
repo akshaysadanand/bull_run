@@ -309,7 +309,7 @@ def ask_followup(
     # Reset tool calls tracking for this invocation
     ask_followup._tool_calls = []
 
-    client = OpenAI(base_url=llm_url, api_key="not-needed")
+    client = OpenAI(base_url=llm_url, api_key="not-needed", timeout=120.0)
     system_prompt = _build_system_prompt(ticker, articles, summary)
 
     messages = [
@@ -354,7 +354,7 @@ def ask_followup(
             tool_call_info = []
 
             # Append assistant's tool call message FIRST (API expects: assistant -> tool results)
-            messages.append({
+            assistant_msg = {
                 "role": "assistant",
                 "tool_calls": [
                     {
@@ -367,7 +367,10 @@ def ask_followup(
                     }
                     for tc in message.tool_calls
                 ],
-            })
+            }
+            if message.content:
+                assistant_msg["content"] = message.content
+            messages.append(assistant_msg)
 
             # Then append tool results
             for tool_call in message.tool_calls:
@@ -475,7 +478,7 @@ def ask_followup_stream(
     ask_followup_stream._tool_calls = []
     ask_followup_stream._error = None
 
-    client = OpenAI(base_url=llm_url, api_key="not-needed")
+    client = OpenAI(base_url=llm_url, api_key="not-needed", timeout=120.0)
     system_prompt = _build_system_prompt(ticker, articles, summary)
 
     messages = [
@@ -561,6 +564,7 @@ def ask_followup_stream(
         if has_tool_calls:
             # Tool call — buffer remaining chunks, reconstruct, execute
             tc_map = {}
+            content_buffer = ""
             if first_delta:
                 for tc in first_delta.tool_calls:
                     idx = tc.index
@@ -572,67 +576,134 @@ def ask_followup_stream(
                         }
                     if tc.function and tc.function.arguments:
                         tc_map[idx]["function"]["arguments"] += tc.function.arguments
+                # Accumulate any content alongside tool calls
+                if first_delta.content:
+                    content_buffer += first_delta.content
 
-            for chunk in stream:
-                delta = chunk.choices[0].delta if chunk.choices else None
-                if delta and delta.tool_calls:
-                    for tc in delta.tool_calls:
-                        idx = tc.index
-                        if idx not in tc_map:
-                            tc_map[idx] = {
-                                "id": tc.id or "",
-                                "type": "function",
-                                "function": {"name": tc.function.name if tc.function else "", "arguments": ""}
+            stream_error = None
+            try:
+                for chunk in stream:
+                    delta = chunk.choices[0].delta if chunk.choices else None
+                    if delta and delta.tool_calls:
+                        for tc in delta.tool_calls:
+                            idx = tc.index
+                            if idx not in tc_map:
+                                tc_map[idx] = {
+                                    "id": tc.id or "",
+                                    "type": "function",
+                                    "function": {"name": tc.function.name if tc.function else "", "arguments": ""}
+                                }
+                            if tc.function and tc.function.arguments:
+                                tc_map[idx]["function"]["arguments"] += tc.function.arguments
+                    # Accumulate any content alongside tool calls
+                    if delta and delta.content:
+                        content_buffer += delta.content
+            except Exception as e:
+                stream_error = e
+                logger.warning("Stream interrupted during tool-call buffering, falling back to non-streaming: %s", e)
+
+            # If streaming failed or we got no tool calls from the stream, fall back to non-streaming
+            if (stream_error or not tc_map) and not stream_error:
+                # Stream completed but yielded no tool calls — shouldn't happen since we peeked,
+                # but handle gracefully by falling back to non-streaming
+                pass
+
+            if stream_error or not tc_map:
+                # Fall back to a non-streaming call to get tool calls reliably
+                try:
+                    response = client.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        tools=TOOLS,
+                        temperature=0.1,
+                    )
+                    message = response.choices[0].message
+                    if message.tool_calls:
+                        for tool_call in message.tool_calls:
+                            tool_name, result = _execute_tool_call(tool_call)
+                            args = json.loads(tool_call.function.arguments)
+                            display = {
+                                "tool": tool_name,
+                                "query": args.get("query", ""),
+                                "url": args.get("url", ""),
+                                "result": result,
                             }
-                        if tc.function and tc.function.arguments:
-                            tc_map[idx]["function"]["arguments"] += tc.function.arguments
-
-            # Execute tools
-            messages.append({
-                "role": "assistant",
-                "tool_calls": list(tc_map.values()),
-            })
-            tool_call_info = []
-            for tc_data in tc_map.values():
-                class _FakeTC:
-                    pass
-                tc = _FakeTC()
-                tc.id = tc_data["id"]
-                tc.type = tc_data["type"]
-                tc.function = type("func", (), {"name": tc_data["function"]["name"], "arguments": tc_data["function"]["arguments"]})()
-
-                tool_name, result = _execute_tool_call(tc)
-                args = json.loads(tc_data["function"]["arguments"])
-                display = {
-                    "tool": tool_name,
-                    "query": args.get("query", ""),
-                    "url": args.get("url", ""),
-                    "result": result,
+                            ask_followup_stream._tool_calls.append(display)
+                            messages.append({
+                                "role": "assistant",
+                                "tool_calls": [{
+                                    "id": tool_call.id,
+                                    "type": tool_call.type,
+                                    "function": {
+                                        "name": tool_call.function.name,
+                                        "arguments": tool_call.function.arguments,
+                                    }
+                                }],
+                            })
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": result,
+                            })
+                        continue
+                except Exception as e2:
+                    logger.exception("Non-streaming fallback for tool calls also failed: %s", e2)
+                    # If both fail, we can't proceed with tool calls
+                    error_msg = f"Tool calling failed: {e2}"
+                    def error_gen(msg=error_msg):
+                        yield msg
+                    ask_followup_stream._error = error_msg
+                    return {"stream": error_gen(), "tool_calls": ask_followup_stream._tool_calls, "error": error_msg}
+            else:
+                # Streaming tool-call buffering succeeded — execute tools
+                assistant_msg = {
+                    "role": "assistant",
+                    "tool_calls": list(tc_map.values()),
                 }
-                tool_call_info.append(display)
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc_data["id"],
-                    "content": result,
-                })
-            ask_followup_stream._tool_calls.extend(tool_call_info)
-            continue
+                if content_buffer:
+                    assistant_msg["content"] = content_buffer
+                messages.append(assistant_msg)
+                tool_call_info = []
+                for tc_data in tc_map.values():
+                    class _FakeTC:
+                        pass
+                    tc = _FakeTC()
+                    tc.id = tc_data["id"]
+                    tc.type = tc_data["type"]
+                    tc.function = type("func", (), {"name": tc_data["function"]["name"], "arguments": tc_data["function"]["arguments"]})()
+
+                    tool_name, result = _execute_tool_call(tc)
+                    args = json.loads(tc_data["function"]["arguments"])
+                    display = {
+                        "tool": tool_name,
+                        "query": args.get("query", ""),
+                        "url": args.get("url", ""),
+                        "result": result,
+                    }
+                    tool_call_info.append(display)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc_data["id"],
+                        "content": result,
+                    })
+                ask_followup_stream._tool_calls.extend(tool_call_info)
+                continue
 
         # Text response — yield first chunk immediately, then stream the rest
         def text_stream(first=first_delta, rest=stream):
-            """Yield text chunks in real-time, stripping tool call XML artifacts."""
+            """Yield text chunks in real-time."""
             # Yield content from the first chunk
             if first and first.content:
-                cleaned = _strip_tool_call_xml(first.content)
-                if cleaned:
-                    yield cleaned
+                yield first.content
             # Stream remaining chunks
-            for chunk in rest:
-                delta = chunk.choices[0].delta if chunk.choices else None
-                if delta and delta.content:
-                    cleaned = _strip_tool_call_xml(delta.content)
-                    if cleaned:
-                        yield cleaned
+            try:
+                for chunk in rest:
+                    delta = chunk.choices[0].delta if chunk.choices else None
+                    if delta and delta.content:
+                        yield delta.content
+            except Exception as e:
+                logger.exception("Stream interrupted during text response")
+                # Generator ends gracefully — consumer gets partial response
 
         return {
             "stream": text_stream(),

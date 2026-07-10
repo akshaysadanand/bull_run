@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -431,38 +432,65 @@ def ask_followup(
                 assistant_msg["content"] = message.content
             messages.append(assistant_msg)
 
-            # Then append tool results (enforce per-turn parallel search limit)
+            # Execute tool calls (parallel where possible, with search limiting)
             turn_search_count = 0
-            for tool_call in message.tool_calls:
-                name = tool_call.function.name
-                args = json.loads(tool_call.function.arguments)
+            tool_results = {}  # tool_call.id -> (tool_name, result, args, blocked)
 
-                # Enforce per-turn parallel search limit
-                blocked = False
-                if name == "searxng_search":
-                    turn_search_count += 1
-                    if turn_search_count > MAX_PARALLEL_SEARCHES:
-                        tool_name = "searxng_search"
-                        result = (
-                            f"Parallel search limit reached ({MAX_PARALLEL_SEARCHES} per turn). "
-                            "Process the results you already have — use web_scrape on the URLs found."
-                        )
-                        blocked = True
-                    elif search_count >= MAX_SEARCHES:
-                        tool_name = "searxng_search"
-                        result = (
-                            f"Search limit reached ({MAX_SEARCHES}/{MAX_SEARCHES}). "
-                            "STOP searching. Use web_scrape to read the full content of URLs from your previous "
-                            "search results instead. Do not issue any more searxng_search calls."
-                        )
-                        blocked = True
-                    else:
-                        search_count += 1
-                        tool_name, result = ("searxng_search", _web_search(args.get("query", "").strip()))
+            # Separate searches (rate-limited) from scrapes (parallelizable)
+            search_calls = [tc for tc in message.tool_calls if tc.function.name == "searxng_search"]
+            other_calls = [tc for tc in message.tool_calls if tc.function.name != "searxng_search"]
+
+            # Execute searches sequentially (to enforce limits)
+            for tc in search_calls:
+                args = json.loads(tc.function.arguments)
+                turn_search_count += 1
+                if turn_search_count > MAX_PARALLEL_SEARCHES:
+                    tool_results[tc.id] = (
+                        "searxng_search",
+                        f"Parallel search limit reached ({MAX_PARALLEL_SEARCHES} per turn). "
+                        "Process the results you already have — use web_scrape on the URLs found.",
+                        args,
+                        True,  # blocked
+                    )
+                elif search_count >= MAX_SEARCHES:
+                    tool_results[tc.id] = (
+                        "searxng_search",
+                        f"Search limit reached ({MAX_SEARCHES}/{MAX_SEARCHES}). "
+                        "STOP searching. Use web_scrape to read the full content of URLs from your previous "
+                        "search results instead.",
+                        args,
+                        True,  # blocked
+                    )
                 else:
-                    tool_name, result = _execute_tool_call(tool_call)
+                    search_count += 1
+                    tool_results[tc.id] = (
+                        "searxng_search",
+                        _web_search(args.get("query", "").strip()),
+                        args,
+                        False,
+                    )
 
-                # Build display info based on tool type (skip blocked calls from UI)
+            # Execute scrapes and other tools in parallel
+            if other_calls:
+                with ThreadPoolExecutor(max_workers=3) as executor:
+                    future_to_tc = {
+                        executor.submit(_execute_tool_call, tc): tc
+                        for tc in other_calls
+                    }
+                    for future in as_completed(future_to_tc):
+                        tc = future_to_tc[future]
+                        args = json.loads(tc.function.arguments)
+                        try:
+                            tool_name, result = future.result()
+                        except Exception as e:
+                            tool_name = tc.function.name
+                            result = f"Tool execution failed: {e}"
+                        tool_results[tc.id] = (tool_name, result, args, False)
+
+            # Build tool call display info and append tool result messages (in original order)
+            for tc in message.tool_calls:
+                tool_name, result, args, blocked = tool_results[tc.id]
+
                 if not blocked:
                     if tool_name == "searxng_search":
                         display = {
@@ -478,11 +506,11 @@ def ask_followup(
                         }
                     else:
                         display = {"tool": tool_name, "result": result}
-
                     tool_call_info.append(display)
+
                 messages.append({
                     "role": "tool",
-                    "tool_call_id": tool_call.id,
+                    "tool_call_id": tc.id,
                     "content": result,
                 })
 

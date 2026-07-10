@@ -191,6 +191,20 @@ class _MCPClient:
             return False
         return True
 
+    @classmethod
+    def reset(cls):
+        """Destroy the current instance and allow a fresh connection on next .get() call."""
+        instance = cls._state.get("_instance")
+        if instance is not None:
+            # Stop the event loop if running
+            if instance._loop is not None and instance._loop.is_running():
+                instance._loop.call_soon_threadsafe(instance._loop.stop)
+            # Wait for thread to finish
+            if instance._thread is not None and instance._thread.is_alive():
+                instance._thread.join(timeout=5)
+        cls._state["_instance"] = None
+        logger.info("MCP client reset — will reconnect on next use.")
+
     def call_tool(self, tool_name: str, arguments: dict) -> str:
         """Call an MCP tool synchronously using the persistent session.
 
@@ -201,7 +215,20 @@ class _MCPClient:
             return "MCP server failed to start."
 
         if not self.is_available:
-            return "MCP server is not available."
+            logger.warning("MCP server not available — attempting reconnection...")
+            _MCPClient.reset()
+            try:
+                new_instance = _MCPClient()
+                _MCPClient._state["_instance"] = new_instance
+                if not new_instance._ready_event.wait(timeout=15):
+                    return "MCP server reconnection timed out."
+                if not new_instance.is_available:
+                    return "MCP server reconnection failed."
+                # Retry the tool call on the new instance
+                return new_instance.call_tool(tool_name, arguments)
+            except Exception as e:
+                logger.exception("MCP server reconnection failed")
+                return f"MCP server reconnection failed: {e}"
 
         # Submit the tool call to the persistent event loop
         async def _call():
@@ -565,6 +592,19 @@ def ask_followup(
         "history": new_history,
         "tool_calls": tool_calls_list,
     }
+
+
+def warm_mcp():
+    """Pre-initialize the MCP server connection.
+
+    Call this at app startup to avoid cold-start delay on the first chat question.
+    Non-blocking — the server starts in a background thread.
+    """
+    try:
+        _MCPClient.get()
+        logger.info("MCP server warm-start initiated.")
+    except Exception:
+        logger.warning("MCP server warm-start failed — will retry on first use.")
 
 
 

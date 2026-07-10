@@ -84,6 +84,12 @@ if "chat_tool_calls" not in st.session_state:
 if "chat_pending" not in st.session_state:
     st.session_state.chat_pending = None
 
+# --- Warm MCP server for chat (non-blocking background init) ---
+if "mcp_warmed" not in st.session_state:
+    from chat import warm_mcp
+    warm_mcp()
+    st.session_state.mcp_warmed = True
+
 st.title("🐂 Bull Run — Stock News Aggregator")
 
 # --- Preset Selector Row ---

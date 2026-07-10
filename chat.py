@@ -19,23 +19,55 @@ CURRENT_YEAR = datetime.now().year
 
 
 def _strip_tool_call_xml(text: str) -> str:
-    """Strip raw tool call XML (\u2458function=...\u2459) from LLM content.
+    """Strip raw tool call XML (`<tool_call>...</tool_call>`) from LLM content.
 
     Some LLMs include the raw function-calling syntax in the content field
     alongside structured tool_calls. This strips those artifacts.
+
+    Matches ANY content between the sentinel characters `<tool_call>` (U+2458) and
+    `</tool_call>` (U+2459), regardless of internal XML structure.
     """
-    # Match <tool_call><function=name> ... </function></tool_call> patterns
-    text = re.sub(r'\u2458\s*<function=[^>]*>.*?</function>\s*\u2459', '', text, flags=re.DOTALL)
-    # Match <tool_call><function=name> <parameter=...> ... </parameter> </function></tool_call> (inline)
-    text = re.sub(r'\u2458\s*<function=[^>]*>\s*<parameter=[^>]*>.*?</function>\s*\u2459', '', text, flags=re.DOTALL)
-    # Match unclosed <tool_call><function=... patterns
-    text = re.sub(r'\u2458\s*<function=[^>]*>.*$', '', text, flags=re.DOTALL | re.MULTILINE)
+    # Match anything between sentinels: `<tool_call> ... _` (handles newlines, malformed XML, etc.)
+    text = re.sub(r'\u2458.*?\u2459', '', text, flags=re.DOTALL)
+    # Match unclosed `<tool_call>` — strip everything from sentinel to end of string
+    text = re.sub(r'\u2458.*$', '', text, flags=re.DOTALL | re.MULTILINE)
     return text.strip()
+
+
+def strip_thinking_tags(text: str) -> tuple[str, str]:
+    """Extract and strip chain-of-thought tags from LLM output.
+
+    Handles <think>...</think>, <thinking>...</thinking>, and trailing
+    unclosed <think> blocks.
+
+    Args:
+        text: Raw LLM output text.
+
+    Returns:
+        Tuple of (cleaned_text, thinking_content). thinking_content is empty
+        string if no thinking tags found.
+    """
+    # Extract thinking content
+    thinking_parts = re.findall(r'<think>(.*?)</think>', text, flags=re.DOTALL | re.IGNORECASE)
+    thinking_parts += re.findall(r'<thinking>(.*?)</thinking>', text, flags=re.DOTALL | re.IGNORECASE)
+    # Catch trailing incomplete thinking fragments
+    thinking_parts += re.findall(r'<think>(.*?)$', text, flags=re.DOTALL | re.IGNORECASE)
+
+    thinking = "\n".join(p.strip() for p in thinking_parts if p.strip())
+
+    # Strip all thinking blocks from the text
+    cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r'<thinking>.*?</thinking>', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r'\s*<think>.*$', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
+
+    return cleaned.strip(), thinking
+
 
 MCP_SERVER_DIR = Path.home() / "Projects" / "web-search-MCP"
 MAX_SEARCH_ITERATIONS = 3
 MAX_CHAT_TURNS = 10
-MAX_SEARCHES = 5  # Hard cap on searxng_search calls per question
+MAX_SEARCHES = 3  # Hard cap on searxng_search calls per question
+MAX_PARALLEL_SEARCHES = 2  # Max searxng_search calls the LLM can make in a single turn
 
 # LLM tool definitions - names match the MCP server's tool names
 WEB_SEARCH_TOOL = {
@@ -174,9 +206,14 @@ class _MCPClient:
             result = await self._session.call_tool(tool_name, arguments)
             return result
 
+        # web_scrape (Playwright) needs more headroom than searxng_search
+        timeout = 60 if tool_name == "web_scrape" else 30
         future = asyncio.run_coroutine_threadsafe(_call(), self._loop)
         try:
-            result = future.result(timeout=30)
+            result = future.result(timeout=timeout)
+        except TimeoutError:
+            logger.warning("MCP tool call timed out for %s (%ds)", tool_name, timeout)
+            return f"MCP call timed out after {timeout}s. The remote service may be slow or unresponsive."
         except Exception as e:
             logger.exception("MCP tool call failed for %s", tool_name)
             return f"MCP call failed: {e}"
@@ -234,14 +271,15 @@ def _build_system_prompt(
                 f"use queries that target {CURRENT_YEAR} and {CURRENT_YEAR + 1}."
     tool_instructions = (
         "\n\nRESEARCH WORKFLOW (strict — follow in order):\n"
-        "1. Do 1-3 searxng_search calls to find relevant URLs. Do NOT exceed 5 searches total.\n"
+        "1. Do 1-2 searxng_search calls to find relevant URLs. Maximum 2 parallel searches per turn, 3 total.\n"
         "2. Use web_scrape on 2-3 of the most relevant URLs from your search results.\n"
         "3. Synthesize your answer from the scraped content, not from search snippets.\n\n"
         "CRITICAL RULES:\n"
         "- Search results only contain short snippets with URLs. You MUST use web_scrape to read full content.\n"
         "- Never answer based solely on search snippets — always scrape at least 2-3 relevant pages first.\n"
-        "- If you have already done several searches, STOP searching and start scraping the URLs you found.\n"
-        "- Do NOT issue more than 5 searxng_search calls total. After that, only use web_scrape."
+        "- After 2 searches, STOP searching and start scraping the URLs you found.\n"
+        "- Do NOT issue more than 3 searxng_search calls total. After that, only use web_scrape.\n"
+        "- For simple factual queries (prices, dates, tickers), 1 search is enough — don't over-search."
     )
     if articles and summary:
         articles_text = "\n".join(
@@ -337,6 +375,7 @@ def ask_followup(
 
     # Track search count to enforce MAX_SEARCHES limit
     search_count = [0]
+    searches_done = [False]  # After first iteration with searches, block further searches
 
     client = OpenAI(base_url=llm_url, api_key="not-needed", timeout=120.0)
     system_prompt = _build_system_prompt(ticker, articles, summary)
@@ -351,13 +390,14 @@ def ask_followup(
     messages.append({"role": "user", "content": question})
 
     # Tool-calling loop (max MAX_SEARCH_ITERATIONS iterations)
-    for _ in range(MAX_SEARCH_ITERATIONS):
+    for iteration in range(MAX_SEARCH_ITERATIONS):
         try:
             response = client.chat.completions.create(
                 model=model,
                 messages=messages,
                 tools=TOOLS,
                 temperature=0.1,
+                max_tokens=4096,
             )
         except Exception as e:
             logger.exception("LLM call failed, falling back to text-only")
@@ -367,6 +407,7 @@ def ask_followup(
                     model=model,
                     messages=messages,
                     temperature=0.1,
+                    max_tokens=4096,
                 )
             except Exception as e2:
                 error_answer = f"LLM error: {e2}"
@@ -401,28 +442,64 @@ def ask_followup(
                 assistant_msg["content"] = message.content
             messages.append(assistant_msg)
 
-            # Then append tool results
+            # Then append tool results (enforce per-turn parallel search limit)
+            turn_search_count = [0]
             for tool_call in message.tool_calls:
-                tool_name, result = _execute_tool_call(tool_call, search_count)
-
-                # Build display info based on tool type
+                name = tool_call.function.name
                 args = json.loads(tool_call.function.arguments)
-                if tool_name == "searxng_search":
-                    display = {
-                        "tool": "searxng_search",
-                        "query": args.get("query", ""),
-                        "result": result,
-                    }
-                elif tool_name == "web_scrape":
-                    display = {
-                        "tool": "web_scrape",
-                        "url": args.get("url", ""),
-                        "result": result,
-                    }
-                else:
-                    display = {"tool": tool_name, "result": result}
 
-                tool_call_info.append(display)
+                # Enforce per-turn parallel search limit
+                blocked = False
+                if name == "searxng_search":
+                    turn_search_count[0] += 1
+                    if searches_done[0]:
+                        # After the first iteration, block all further searches
+                        tool_name = "searxng_search"
+                        result = (
+                            "Searches are now closed. You have search results with URLs. "
+                            "Use web_scrape to read the full content of the most relevant URLs, "
+                            "or synthesize your answer from what you already have."
+                        )
+                        blocked = True
+                    elif turn_search_count[0] > MAX_PARALLEL_SEARCHES:
+                        tool_name = "searxng_search"
+                        result = (
+                            f"Parallel search limit reached ({MAX_PARALLEL_SEARCHES} per turn). "
+                            "Process the results you already have — use web_scrape on the URLs found."
+                        )
+                        blocked = True
+                    elif search_count[0] >= MAX_SEARCHES:
+                        tool_name = "searxng_search"
+                        result = (
+                            f"Search limit reached ({MAX_SEARCHES}/{MAX_SEARCHES}). "
+                            "STOP searching. Use web_scrape to read the full content of URLs from your previous "
+                            "search results instead. Do not issue any more searxng_search calls."
+                        )
+                        blocked = True
+                    else:
+                        search_count[0] += 1
+                        tool_name, result = ("searxng_search", _web_search(args.get("query", "").strip()))
+                else:
+                    tool_name, result = _execute_tool_call(tool_call, search_count)
+
+                # Build display info based on tool type (skip blocked calls from UI)
+                if not blocked:
+                    if tool_name == "searxng_search":
+                        display = {
+                            "tool": "searxng_search",
+                            "query": args.get("query", ""),
+                            "result": result,
+                        }
+                    elif tool_name == "web_scrape":
+                        display = {
+                            "tool": "web_scrape",
+                            "url": args.get("url", ""),
+                            "result": result,
+                        }
+                    else:
+                        display = {"tool": tool_name, "result": result}
+
+                    tool_call_info.append(display)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
@@ -433,6 +510,11 @@ def ask_followup(
             if not hasattr(ask_followup, "_tool_calls"):
                 ask_followup._tool_calls = []
             ask_followup._tool_calls.extend(tool_call_info)
+
+            # After the first iteration with searches, lock searches so subsequent
+            # iterations can only scrape or answer.
+            if search_count[0] > 0:
+                searches_done[0] = True
 
             # Enforce search -> scrape pattern: if this iteration was all searches and we've
             # already done searches before, inject a corrective reminder forcing web_scrape.
@@ -455,7 +537,9 @@ def ask_followup(
             continue  # Loop back to call LLM again with tool results
 
         # Text response - done
-        answer = _strip_tool_call_xml(message.content or "")
+        raw_answer = message.content or ""
+        answer, _ = strip_thinking_tags(raw_answer)
+        answer = _strip_tool_call_xml(answer)
         new_history = trimmed_history + [
             {"role": "user", "content": question},
             {"role": "assistant", "content": answer},
@@ -467,13 +551,24 @@ def ask_followup(
         }
 
     # Exceeded max iterations - call LLM one final time with accumulated context (no tools)
+    # Add a final instruction to force a text response
+    messages.append({
+        "role": "user",
+        "content": (
+            "Please provide your final answer now based on the research results above. "
+            "Do not make any more tool calls — just write your answer."
+        ),
+    })
     try:
         final_response = client.chat.completions.create(
             model=model,
             messages=messages,
             temperature=0.1,
+            max_tokens=4096,
         )
-        answer = _strip_tool_call_xml(final_response.choices[0].message.content or "Search limit reached.")
+        raw_answer = final_response.choices[0].message.content or "Search limit reached."
+        answer, _ = strip_thinking_tags(raw_answer)
+        answer = _strip_tool_call_xml(answer)
     except Exception:
         answer = "Search limit reached. I'll provide my best answer with the information I have."
 

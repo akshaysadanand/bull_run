@@ -474,8 +474,7 @@ if ticker:
 
     # Process pending question (non-streaming)
     if st.session_state.chat_pending:
-        import re
-        from chat import ask_followup
+        from chat import ask_followup, strip_thinking_tags
 
         pending = st.session_state.chat_pending
 
@@ -509,20 +508,9 @@ if ticker:
                         status.markdown(f"{i}. {tool}")
         st.session_state.chat_tool_calls = result["tool_calls"]
 
-        # Strip thinking tags from answer
+        # Strip thinking tags from answer (uses centralized function from chat.py)
         full_answer = result["answer"] or ""
-        thinking = ""
-        # Extract thinking content before stripping
-        for pattern in [r'<think>(.*?)</think>', r'<thinking>(.*?)</thinking>']:
-            matches = re.findall(pattern, full_answer, re.DOTALL | re.IGNORECASE)
-            if matches:
-                thinking = "\n".join(m.strip() for m in matches).strip()
-                break
-        # Clean answer — strip thinking tags
-        full_answer = re.sub(r'<think>.*?</think>', '', full_answer, flags=re.DOTALL | re.IGNORECASE)
-        full_answer = re.sub(r'<thinking>.*?</thinking>', '', full_answer, flags=re.DOTALL | re.IGNORECASE)
-        full_answer = re.sub(r'\s*<think>.*$', '', full_answer, flags=re.DOTALL | re.IGNORECASE)
-        full_answer = full_answer.strip()
+        full_answer, thinking = strip_thinking_tags(full_answer)
 
         # Render answer as proper markdown
         st.markdown("**Assistant:**")

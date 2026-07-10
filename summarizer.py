@@ -1,6 +1,5 @@
 """Summarize stock news articles using a local LLM."""
 
-import re
 from typing import Dict
 
 from openai import OpenAI
@@ -46,19 +45,8 @@ def summarize_news(articles: list[dict], llm_url: str, model: str) -> Dict[str, 
 
     content = response.choices[0].message.content or ""
 
-    # Extract chain-of-thought blocks before stripping them
-    thinking_parts = re.findall(r'<think>(.*?)</think>', content, flags=re.DOTALL | re.IGNORECASE)
-    thinking_parts += re.findall(r'<thinking>(.*?)</thinking>', content, flags=re.DOTALL | re.IGNORECASE)
-    # Also catch trailing incomplete thinking fragments
-    trailing = re.findall(r'<think>(.*?)$', content, flags=re.DOTALL | re.IGNORECASE)
-    thinking_parts += trailing
-
-    thinking = "\n".join(p.strip() for p in thinking_parts if p.strip())
-
-    # Strip all chain-of-thought blocks from the summary
-    summary = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL | re.IGNORECASE)
-    summary = re.sub(r'<thinking>.*?</thinking>', '', summary, flags=re.DOTALL | re.IGNORECASE)
-    summary = re.sub(r'\s*<think>.*$', '', summary, flags=re.DOTALL | re.IGNORECASE)
+    from chat import strip_thinking_tags
+    summary, thinking = strip_thinking_tags(content)
 
     return {
         "summary": summary.strip(),

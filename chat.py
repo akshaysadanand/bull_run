@@ -18,6 +18,13 @@ logger = logging.getLogger(__name__)
 
 CURRENT_YEAR = datetime.now().year
 
+MCP_SERVER_DIR = Path.home() / "Projects" / "web-search-MCP"
+MAX_SEARCH_ITERATIONS = 3
+MAX_CHAT_TURNS = 10
+MAX_SEARCHES = 3  # Hard cap on searxng_search calls per question
+MAX_PARALLEL_SEARCHES = 2  # Max searxng_search calls the LLM can make in a single turn
+MAX_SCRAPE_CONTENT_LENGTH = 4000  # Truncate scraped page content to limit context size
+
 
 def _strip_tool_call_xml(text: str) -> str:
     """Strip raw tool call XML (`<tool_call>...</tool_call>`) from LLM content.
@@ -66,12 +73,6 @@ def strip_thinking_tags(text: str) -> tuple[str, str]:
     return cleaned.strip(), thinking
 
 
-MCP_SERVER_DIR = Path.home() / "Projects" / "web-search-MCP"
-MAX_SEARCH_ITERATIONS = 3
-MAX_CHAT_TURNS = 10
-MAX_SEARCHES = 3  # Hard cap on searxng_search calls per question
-MAX_PARALLEL_SEARCHES = 2  # Max searxng_search calls the LLM can make in a single turn
-MAX_SCRAPE_CONTENT_LENGTH = 4000  # Truncate scraped page content to limit context size
 
 # LLM tool definitions - names match the MCP server's tool names
 WEB_SEARCH_TOOL = {
@@ -423,7 +424,6 @@ def _run_tool_loop(
                 messages=messages,
                 tools=TOOLS,
                 temperature=0.1,
-                max_tokens=4096,
             )
         except Exception as e:
             logger.exception("LLM call failed, falling back to text-only")
@@ -432,7 +432,6 @@ def _run_tool_loop(
                     model=model,
                     messages=messages,
                     temperature=0.1,
-                    max_tokens=4096,
                 )
             except Exception as e2:
                 return {
@@ -601,7 +600,6 @@ def stream_final_answer(messages: list[dict], llm_url: str, model: str):
             model=model,
             messages=messages,
             temperature=0.1,
-            max_tokens=4096,
             stream=True,
         )
         for chunk in stream:

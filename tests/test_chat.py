@@ -262,3 +262,177 @@ def test_ask_followup_handles_max_iterations():
     # Should have made MAX_SEARCH_ITERATIONS tool calls + 1 final call without tools
     assert mock_client.chat.completions.create.call_count == MAX_SEARCH_ITERATIONS + 1
     assert result["answer"] != ""
+
+
+# --- Tests for strip_thinking_tags ---
+
+from chat import strip_thinking_tags
+
+
+def test_strip_thinking_tags_extracts_think():
+    """Verify strip_thinking_tags extracts and strips <think> blocks."""
+    text = "<think>Let me reason about this.</think>Here is the answer."
+    cleaned, thinking = strip_thinking_tags(text)
+    assert cleaned == "Here is the answer."
+    assert "Let me reason" in thinking
+
+
+def test_strip_thinking_tags_extracts_thinking():
+    """Verify strip_thinking_tags extracts and strips <thinking> blocks."""
+    text = "<thinking>Step by step analysis.</thinking>\n\nThe result is 42."
+    cleaned, thinking = strip_thinking_tags(text)
+    assert "The result is 42" in cleaned
+    assert "Step by step" in thinking
+    assert "<thinking>" not in cleaned
+
+
+def test_strip_thinking_tags_handles_trailing_think():
+    """Verify strip_thinking_tags handles unclosed trailing <think> blocks."""
+    text = "Partial answer. <think>Still thinking about this"
+    cleaned, thinking = strip_thinking_tags(text)
+    assert "Partial answer" in cleaned
+    assert "<think>" not in cleaned
+    assert "Still thinking" in thinking
+
+
+def test_strip_thinking_tags_no_tags():
+    """Verify strip_thinking_tags returns text unchanged when no tags present."""
+    text = "Just a plain answer with no thinking."
+    cleaned, thinking = strip_thinking_tags(text)
+    assert cleaned == text
+    assert thinking == ""
+
+
+# --- Tests for _strip_tool_call_xml ---
+
+from chat import _strip_tool_call_xml
+
+
+def test_strip_tool_call_xml_strips_sentinels():
+    """Verify _strip_tool_call_xml strips Unicode sentinel tool call markers."""
+    text = "Some text \u2458{\"name\": \"web_search\"}\u2459 more text"
+    result = _strip_tool_call_xml(text)
+    assert "Some text" in result
+    assert "more text" in result
+    assert "\u2458" not in result
+    assert "web_search" not in result
+
+
+def test_strip_tool_call_xml_strips_trailing():
+    """Verify _strip_tool_call_xml strips unclosed trailing sentinel."""
+    text = "Answer text \u2458{\"name\": \"web_search\""
+    result = _strip_tool_call_xml(text)
+    assert "Answer text" in result
+    assert "\u2458" not in result
+
+
+def test_strip_tool_call_xml_no_sentinels():
+    """Verify _strip_tool_call_xml returns text unchanged when no sentinels."""
+    text = "Just a normal answer."
+    result = _strip_tool_call_xml(text)
+    assert result == text
+
+
+# --- Tests for _run_tool_loop ---
+
+def test_run_tool_loop_returns_text_answer():
+    """Verify _run_tool_loop returns answer when LLM gives text response."""
+    from chat import _run_tool_loop
+
+    mock_response = MagicMock()
+    mock_response.choices[0].message.content = "AAPL looks strong."
+    mock_response.choices[0].message.tool_calls = None
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.return_value = mock_response
+
+    with patch("chat.OpenAI", return_value=mock_client):
+        result = _run_tool_loop(
+            question="How is AAPL?",
+            ticker="AAPL",
+            history=[],
+            llm_url="http://localhost:8080/v1",
+            model="qwen",
+        )
+
+    assert result["needs_final_call"] is False
+    assert "AAPL looks strong" in result["answer"]
+    assert result["tool_calls"] == []
+
+
+def test_run_tool_loop_needs_final_call_after_max_iterations():
+    """Verify _run_tool_loop sets needs_final_call when loop exhausts."""
+    from chat import _run_tool_loop, MAX_SEARCH_ITERATIONS
+
+    mock_tool_call = MagicMock()
+    mock_tool_call.id = "call_999"
+    mock_tool_call.type = "function"
+    mock_tool_call.function.name = "web_scrape"
+    mock_tool_call.function.arguments = '{"url": "https://example.com"}'
+
+    mock_response = MagicMock()
+    mock_response.choices[0].message.content = None
+    mock_response.choices[0].message.tool_calls = [mock_tool_call]
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.return_value = mock_response
+
+    with patch("chat.OpenAI", return_value=mock_client):
+        with patch("chat._web_scrape", return_value="Scraped content"):
+            result = _run_tool_loop(
+                question="Read this article",
+                ticker="AAPL",
+                history=[],
+                llm_url="http://localhost:8080/v1",
+                model="qwen",
+            )
+
+    assert result["needs_final_call"] is True
+    assert result["answer"] is None
+    assert mock_client.chat.completions.create.call_count == MAX_SEARCH_ITERATIONS
+
+
+# --- Tests for stream_final_answer ---
+
+def test_stream_final_answer_yields_chunks():
+    """Verify stream_final_answer yields text chunks from streaming response."""
+    from chat import stream_final_answer
+
+    # Mock a streaming response
+    chunk1 = MagicMock()
+    chunk1.choices[0].delta.content = "Hello "
+    chunk2 = MagicMock()
+    chunk2.choices[0].delta.content = "world!"
+    chunk3 = MagicMock()
+    chunk3.choices[0].delta.content = None  # Empty delta at end
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.return_value = iter([chunk1, chunk2, chunk3])
+
+    with patch("chat.OpenAI", return_value=mock_client):
+        chunks = list(stream_final_answer(
+            messages=[{"role": "user", "content": "test"}],
+            llm_url="http://localhost:8080/v1",
+            model="qwen",
+        ))
+
+    assert chunks == ["Hello ", "world!"]
+
+
+# --- Tests for scrape content truncation ---
+
+def test_web_scrape_truncates_long_content():
+    """Verify _web_scrape truncates content exceeding MAX_SCRAPE_CONTENT_LENGTH."""
+    from chat import _web_scrape, MAX_SCRAPE_CONTENT_LENGTH
+
+    long_content = "A" * (MAX_SCRAPE_CONTENT_LENGTH + 1000)
+
+    with patch("chat._MCPClient.get") as mock_mcp_get:
+        mock_client = MagicMock()
+        mock_client.call_tool.return_value = long_content
+        mock_mcp_get.return_value = mock_client
+
+        result = _web_scrape("https://example.com/long-article")
+
+    assert len(result) < len(long_content)
+    assert "[Content truncated" in result

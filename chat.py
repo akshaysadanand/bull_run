@@ -6,24 +6,27 @@ import logging
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from openai import OpenAI
+from datetime import datetime
+
+from utils.prompts import SystemPrompts
 
 logger = logging.getLogger(__name__)
 
-CURRENT_YEAR = datetime.now().year
+CURRENT_DATE = datetime.now().strftime("%B %d, %Y")
 
 MCP_SERVER_DIR = Path.home() / "Projects" / "web-search-MCP"
-MAX_SEARCH_ITERATIONS = 3
+MAX_SEARCH_ITERATIONS = 10
 MAX_CHAT_TURNS = 10
-MAX_SEARCHES = 3  # Hard cap on searxng_search calls per question
+MAX_SEARCHES = 5  # Hard cap on searxng_search calls per question
 MAX_PARALLEL_SEARCHES = 2  # Max searxng_search calls the LLM can make in a single turn
-MAX_SCRAPE_CONTENT_LENGTH = 4000  # Truncate scraped page content to limit context size
+MAX_SCRAPE_CONTENT_LENGTH = 10000  # Truncate scraped page content to limit context size
 
 
 def _strip_tool_call_xml(text: str) -> str:
@@ -37,8 +40,14 @@ def _strip_tool_call_xml(text: str) -> str:
     """
     # Match anything between sentinels: `<tool_call> ... _` (handles newlines, malformed XML, etc.)
     text = re.sub(r'\u2458.*?\u2459', '', text, flags=re.DOTALL)
-    # Match unclosed `<tool_call>` — strip everything from sentinel to end of string
+    # Match unclosed `<tool_call>` sentinel — strip everything from sentinel to end of string
     text = re.sub(r'\u2458.*$', '', text, flags=re.DOTALL | re.MULTILINE)
+    
+    # Also strip literal <tool_call> XML blocks
+    text = re.sub(r'<tool_call>.*?</tool_call>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    # Match unclosed literal <tool_call>
+    text = re.sub(r'<tool_call>.*$', '', text, flags=re.DOTALL | re.IGNORECASE | re.MULTILINE)
+    
     return text.strip()
 
 
@@ -61,6 +70,7 @@ def strip_thinking_tags(text: str) -> tuple[str, str]:
     # Catch trailing unclosed <think> blocks — negative lookahead ensures we skip
     # blocks that already have a closing tag (avoiding double-extraction)
     trailing = re.findall(r'<think>(?!.*</think>)(.*?)$', text, flags=re.DOTALL | re.IGNORECASE)
+    trailing += re.findall(r'<thinking>(?!.*</thinking>)(.*?)$', text, flags=re.DOTALL | re.IGNORECASE)
     thinking_parts += trailing
 
     thinking = "\n".join(p.strip() for p in thinking_parts if p.strip())
@@ -69,6 +79,7 @@ def strip_thinking_tags(text: str) -> tuple[str, str]:
     cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE)
     cleaned = re.sub(r'<thinking>.*?</thinking>', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
     cleaned = re.sub(r'\s*<think>.*$', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r'\s*<thinking>.*$', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
 
     return cleaned.strip(), thinking
 
@@ -159,8 +170,8 @@ class _MCPClient:
 
             try:
                 server_params = StdioServerParameters(
-                    command="uv",
-                    args=["--directory", str(MCP_SERVER_DIR), "run", "web-search-mcp"],
+                    command="bash",
+                    args=[str(MCP_SERVER_DIR / "start.sh")],
                 )
 
                 async def _init():
@@ -302,44 +313,27 @@ def _build_system_prompt(
     Returns:
         System prompt string tailored to available context.
     """
-    year_hint = f"Today's year is {CURRENT_YEAR}. When searching for upcoming events, earnings, or catalysts, " \
-                f"use queries that target {CURRENT_YEAR} and {CURRENT_YEAR + 1}."
-    tool_instructions = (
-        "\n\nRESEARCH WORKFLOW (strict — follow in order):\n"
-        "1. Do 1-2 searxng_search calls to find relevant URLs. Maximum 2 parallel searches per turn, 3 total.\n"
-        "2. Use web_scrape on 2-3 of the most relevant URLs from your search results.\n"
-        "3. Synthesize your answer from the scraped content, not from search snippets.\n\n"
-        "CRITICAL RULES:\n"
-        "- Search results only contain short snippets with URLs. You MUST use web_scrape to read full content.\n"
-        "- Never answer based solely on search snippets — always scrape at least 2-3 relevant pages first.\n"
-        "- After 2 searches, STOP searching and start scraping the URLs you found.\n"
-        "- Do NOT issue more than 3 searxng_search calls total. After that, only use web_scrape.\n"
-        "- For simple factual queries (prices, dates, tickers), 1 search is enough — don't over-search."
-    )
+    year_hint = SystemPrompts.YEAR_HINT.format(current_date=CURRENT_DATE)
+
     if articles and summary:
         articles_text = "\n".join(
-            f"- {a.get('title', 'Untitled')} ({a.get('source', 'Unknown')}, {a.get('date', '')})"
+            f"- {a.get('title', 'Untitled')} ({a.get('source', 'Unknown')}, {a.get('date', '')}) - URL: {a.get('url', 'N/A')}"
             for a in articles
         )
-        return (
-            f"You are a financial news analyst helping a user understand news about {ticker}.\n"
-            f"You have access to the following context:\n\n"
-            f"INITIAL SUMMARY:\n{summary}\n\n"
-            f"ARTICLES:\n{articles_text}\n\n"
-            f"{year_hint}\n\n"
-            f"Answer the user's question based on this context. "
-            f"If you need additional current information, follow the research workflow below.\n"
-            f"Be concise and cite sources when referencing specific claims."
-            f"{tool_instructions}"
+        return SystemPrompts.WITH_CONTEXT_TEMPLATE.format(
+            ticker=ticker,
+            summary=summary,
+            articles_text=articles_text,
+            year_hint=year_hint,
+            citation_rule=SystemPrompts.CITATION_RULE,
+            research_workflow=SystemPrompts.RESEARCH_WORKFLOW
         )
     else:
-        return (
-            f"You are a financial news analyst helping a user research {ticker}.\n"
-            f"{year_hint}\n\n"
-            f"Follow the research workflow below to answer the user's question.\n"
-            f"Be concise and cite sources when referencing specific claims."
-            f"Always cite the sources you used to form your answer, and include the URL of each source in your response."
-            f"{tool_instructions}"
+        return SystemPrompts.NO_CONTEXT_TEMPLATE.format(
+            ticker=ticker,
+            year_hint=year_hint,
+            citation_rule=SystemPrompts.CITATION_RULE,
+            research_workflow=SystemPrompts.RESEARCH_WORKFLOW
         )
 
 
@@ -423,7 +417,7 @@ def _run_tool_loop(
                 model=model,
                 messages=messages,
                 tools=TOOLS,
-                temperature=0.1,
+                temperature=0.6,
             )
         except Exception as e:
             logger.exception("LLM call failed, falling back to text-only")
@@ -431,7 +425,7 @@ def _run_tool_loop(
                 response = client.chat.completions.create(
                     model=model,
                     messages=messages,
-                    temperature=0.1,
+                    temperature=0.6,
                 )
             except Exception as e2:
                 return {
@@ -447,6 +441,14 @@ def _run_tool_loop(
         if message.tool_calls:
             tool_call_info = []
 
+            # Accumulate thinking from this iteration
+            cleaned_content, iteration_thinking = strip_thinking_tags(message.content or "")
+            if iteration_thinking:
+                if total_thinking:
+                    total_thinking += "\n" + iteration_thinking
+                else:
+                    total_thinking = iteration_thinking
+
             assistant_msg = {
                 "role": "assistant",
                 "tool_calls": [
@@ -461,8 +463,9 @@ def _run_tool_loop(
                     for tc in message.tool_calls
                 ],
             }
-            if message.content:
-                assistant_msg["content"] = message.content
+            # Save cleaned content to history to prevent reasoning context poisoning
+            if cleaned_content.strip():
+                assistant_msg["content"] = cleaned_content.strip()
             messages.append(assistant_msg)
 
             # Execute tool calls (parallel where possible, with search limiting)
@@ -580,6 +583,273 @@ def _run_tool_loop(
     }
 
 
+def run_tool_loop_stream(
+    question: str,
+    ticker: str,
+    history: list[dict],
+    llm_url: str,
+    model: str,
+    articles: Optional[list[dict]] = None,
+    summary: Optional[str] = None,
+):
+    """Streaming generator that yields events as the LLM researches and answers.
+
+    Uses `stream=True` with the OpenAI client to provide real-time updates
+    on content chunks, tool calls, and final results.
+
+    Args:
+        question: User's question.
+        ticker: Stock ticker symbol.
+        history: Prior chat messages [{role, content}, ...].
+        llm_url: OpenAI-compatible LLM base URL.
+        model: Model name.
+        articles: Optional scraped articles for context.
+        summary: Optional initial summary for context.
+
+    Yields:
+        Dict events with types:
+        - {"type": "content_chunk", "chunk": delta_content, "full_content": accumulated}
+        - {"type": "tool_start", "tool": tool_name, "args": parsed_args_dict}
+        - {"type": "tool_result", "tool": tool_name, "result": result_text}
+        - {"type": "done", "messages": ..., "tool_calls": ..., "trimmed_history": ...,
+           "answer": ..., "thinking": ..., "needs_final_call": ...}
+        - {"type": "error", "error": error_message}
+    """
+    tool_calls_list = []
+    search_count = 0
+
+    client = OpenAI(base_url=llm_url, api_key="not-needed", timeout=120.0)
+    system_prompt = _build_system_prompt(ticker, articles, summary)
+
+    messages = [{"role": "system", "content": system_prompt}]
+
+    trimmed_history = history[-(MAX_CHAT_TURNS * 2):] if len(history) > MAX_CHAT_TURNS * 2 else history
+    # Only keep role and content for API compatibility, drop tool_calls/thinking metadata
+    clean_history = [{"role": m["role"], "content": m["content"]} for m in trimmed_history]
+    messages.extend(clean_history)
+    messages.append({"role": "user", "content": question})
+
+    total_thinking = ""
+
+    for iteration in range(MAX_SEARCH_ITERATIONS):
+        try:
+            stream = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=TOOLS,
+                temperature=0.6,
+                stream=True,
+            )
+        except Exception as e:
+            logger.exception("LLM call failed")
+            yield {"type": "error", "error": str(e)}
+            return
+
+        current_content = ""
+        current_tool_calls = []
+
+        # Consume the streaming response
+        is_thinking = False
+        for chunk in stream:
+            delta = chunk.choices[0].delta
+            
+            # Support vLLM/OpenRouter reasoning_content natively
+            r_content = getattr(delta, "reasoning_content", None)
+            if not r_content and hasattr(delta, "model_extra") and delta.model_extra:
+                r_content = delta.model_extra.get("reasoning_content")
+                
+            content_to_add = ""
+            if r_content:
+                if not is_thinking:
+                    content_to_add += "<think>\n"
+                    is_thinking = True
+                content_to_add += r_content
+                
+            if delta.content:
+                if is_thinking:
+                    content_to_add += "\n</think>\n"
+                    is_thinking = False
+                content_to_add += delta.content
+
+            if content_to_add:
+                current_content += content_to_add
+                _, current_thinking = strip_thinking_tags(current_content)
+                yield {
+                    "type": "content_chunk",
+                    "chunk": content_to_add,
+                    "full_content": current_content,
+                    "current_thinking": current_thinking,
+                }
+                
+            if delta.tool_calls:
+                for tc_chunk in delta.tool_calls:
+                    while len(current_tool_calls) <= tc_chunk.index:
+                        current_tool_calls.append({
+                            "id": "",
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""}
+                        })
+                    tc = current_tool_calls[tc_chunk.index]
+                    if tc_chunk.id:
+                        tc["id"] += tc_chunk.id
+                    if tc_chunk.function.name:
+                        tc["function"]["name"] += tc_chunk.function.name
+                    if tc_chunk.function.arguments:
+                        tc["function"]["arguments"] += tc_chunk.function.arguments
+
+        if is_thinking:
+            current_content += "\n</think>\n"
+
+        # If tool calls detected, execute them and loop back
+        if current_tool_calls:
+            # Accumulate thinking from this iteration before resetting current_content
+            cleaned_content, iteration_thinking = strip_thinking_tags(current_content)
+            if iteration_thinking:
+                if total_thinking:
+                    total_thinking += "\n" + iteration_thinking
+                else:
+                    total_thinking = iteration_thinking
+            assistant_msg = {
+                "role": "assistant",
+                "tool_calls": current_tool_calls,
+            }
+            # Save cleaned content to history to prevent reasoning context poisoning
+            if cleaned_content.strip():
+                assistant_msg["content"] = cleaned_content.strip()
+            messages.append(assistant_msg)
+
+            # Separate searches (rate-limited) from scrapes (parallelizable)
+            search_calls = [tc for tc in current_tool_calls if tc["function"]["name"] == "searxng_search"]
+            other_calls = [tc for tc in current_tool_calls if tc["function"]["name"] != "searxng_search"]
+
+            turn_search_count = 0
+            tool_results = {}  # tc_id -> (tool_name, result, args, blocked)
+
+            # Execute searches sequentially (to enforce limits)
+            for tc in search_calls:
+                args = json.loads(tc["function"]["arguments"])
+                turn_search_count += 1
+                if turn_search_count > MAX_PARALLEL_SEARCHES:
+                    tool_results[tc["id"]] = (
+                        "searxng_search",
+                        f"Parallel search limit reached ({MAX_PARALLEL_SEARCHES} per turn). "
+                        "Process the results you already have — use web_scrape on the URLs found.",
+                        args,
+                        True,  # blocked
+                    )
+                elif search_count >= MAX_SEARCHES:
+                    tool_results[tc["id"]] = (
+                        "searxng_search",
+                        f"Search limit reached ({MAX_SEARCHES}/{MAX_SEARCHES}). "
+                        "STOP searching. Use web_scrape to read the full content of URLs from your previous "
+                        "search results instead.",
+                        args,
+                        True,  # blocked
+                    )
+                else:
+                    search_count += 1
+                    yield {"type": "tool_start", "tool": "searxng_search", "args": args}
+                    result = _web_search(args.get("query", "").strip())
+                    yield {"type": "tool_result", "tool": "searxng_search", "result": result}
+                    tool_results[tc["id"]] = ("searxng_search", result, args, False)
+
+            # Execute scrapes and other tools in parallel
+            if other_calls:
+                for tc in other_calls:
+                    args = json.loads(tc["function"]["arguments"])
+                    yield {"type": "tool_start", "tool": tc["function"]["name"], "args": args}
+
+                with ThreadPoolExecutor(max_workers=3) as executor:
+                    future_to_tc = {
+                        executor.submit(
+                            _execute_tool_call,
+                            SimpleNamespace(
+                                function=SimpleNamespace(
+                                    name=tc["function"]["name"],
+                                    arguments=tc["function"]["arguments"],
+                                )
+                            ),
+                        ): tc
+                        for tc in other_calls
+                    }
+                    for future in as_completed(future_to_tc):
+                        tc = future_to_tc[future]
+                        args = json.loads(tc["function"]["arguments"])
+                        try:
+                            tool_name, result = future.result()
+                        except Exception as e:
+                            tool_name = tc["function"]["name"]
+                            result = f"Tool execution failed: {e}"
+                        yield {"type": "tool_result", "tool": tool_name, "result": result}
+                        tool_results[tc["id"]] = (tool_name, result, args, False)
+
+            # Build tool call display info and append tool result messages (in original order)
+            for tc in current_tool_calls:
+                tool_name, result, args, blocked = tool_results[tc["id"]]
+
+                if not blocked:
+                    if tool_name == "searxng_search":
+                        display = {
+                            "tool": "searxng_search",
+                            "query": args.get("query", ""),
+                            "result": result,
+                        }
+                    elif tool_name == "web_scrape":
+                        display = {
+                            "tool": "web_scrape",
+                            "url": args.get("url", ""),
+                            "result": result,
+                        }
+                    else:
+                        display = {"tool": tool_name, "result": result}
+                    tool_calls_list.append(display)
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": result,
+                })
+
+            continue
+
+        # Text response — done
+        cleaned, thinking = strip_thinking_tags(current_content)
+        cleaned = _strip_tool_call_xml(cleaned)
+        # Combine thinking from all iterations
+        full_thinking = total_thinking + ("\n" + thinking if total_thinking and thinking else "")
+        full_thinking = full_thinking or thinking
+        yield {
+            "type": "done",
+            "messages": messages,
+            "tool_calls": tool_calls_list,
+            "trimmed_history": trimmed_history,
+            "answer": cleaned,
+            "thinking": full_thinking,
+            "total_thinking": full_thinking,
+            "needs_final_call": False,
+        }
+        return
+
+    # Exceeded max iterations — need a final call to get the answer
+    messages.append({
+        "role": "system",
+        "content": (
+            "Please provide your final answer now based on the research results above. "
+            "Do not make any more tool calls — just write your answer."
+        ),
+    })
+    yield {
+        "type": "done",
+        "messages": messages,
+        "tool_calls": tool_calls_list,
+        "trimmed_history": trimmed_history,
+        "answer": None,
+        "thinking": total_thinking,
+        "total_thinking": total_thinking,
+        "needs_final_call": True,
+    }
+
+
 def stream_final_answer(messages: list[dict], llm_url: str, model: str):
     """Generator that yields text chunks from a streaming LLM call.
 
@@ -599,13 +869,31 @@ def stream_final_answer(messages: list[dict], llm_url: str, model: str):
         stream = client.chat.completions.create(
             model=model,
             messages=messages,
-            temperature=0.1,
+            temperature=0.6,
             stream=True,
         )
+        is_thinking = False
         for chunk in stream:
             delta = chunk.choices[0].delta
+            
+            r_content = getattr(delta, "reasoning_content", None)
+            if not r_content and hasattr(delta, "model_extra") and delta.model_extra:
+                r_content = delta.model_extra.get("reasoning_content")
+                
+            if r_content:
+                if not is_thinking:
+                    yield "<think>\n"
+                    is_thinking = True
+                yield r_content
+                
             if delta.content:
+                if is_thinking:
+                    yield "\n</think>\n"
+                    is_thinking = False
                 yield delta.content
+                
+        if is_thinking:
+            yield "\n</think>\n"
     except Exception as e:
         logger.exception("Streaming LLM call failed")
         yield f"LLM error: {e}"

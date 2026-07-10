@@ -312,12 +312,11 @@ def _build_system_prompt(
         )
 
 
-def _execute_tool_call(tool_call, search_count: list[int]) -> tuple[str, str]:
+def _execute_tool_call(tool_call) -> tuple[str, str]:
     """Execute an LLM tool call and return (tool_name, result_text).
 
     Args:
         tool_call: The tool call object from the LLM response.
-        search_count: Mutable list with single int tracking total searches (allows mutation in closure).
 
     Returns:
         Tuple of (tool_name, result_text).
@@ -329,14 +328,6 @@ def _execute_tool_call(tool_call, search_count: list[int]) -> tuple[str, str]:
         query = args.get("query", "").strip()
         if not query:
             return ("searxng_search", "Error: query parameter is required and cannot be empty.")
-        search_count[0] += 1
-        if search_count[0] > MAX_SEARCHES:
-            return (
-                "searxng_search",
-                f"Search limit reached ({MAX_SEARCHES}/{MAX_SEARCHES}). "
-                "STOP searching. Use web_scrape to read the full content of URLs from your previous "
-                "search results instead. Do not issue any more searxng_search calls."
-            )
         return ("searxng_search", _web_search(query))
     elif name == "web_scrape":
         url = args.get("url", "").strip()
@@ -379,7 +370,6 @@ def ask_followup(
 
     # Track search count to enforce MAX_SEARCHES limit
     search_count = [0]
-    searches_done = [False]  # After first iteration with searches, block further searches
 
     client = OpenAI(base_url=llm_url, api_key="not-needed", timeout=120.0)
     system_prompt = _build_system_prompt(ticker, articles, summary)
@@ -447,7 +437,7 @@ def ask_followup(
             messages.append(assistant_msg)
 
             # Then append tool results (enforce per-turn parallel search limit)
-            turn_search_count = [0]
+            turn_search_count = 0
             for tool_call in message.tool_calls:
                 name = tool_call.function.name
                 args = json.loads(tool_call.function.arguments)
@@ -455,17 +445,8 @@ def ask_followup(
                 # Enforce per-turn parallel search limit
                 blocked = False
                 if name == "searxng_search":
-                    turn_search_count[0] += 1
-                    if searches_done[0]:
-                        # After the first iteration, block all further searches
-                        tool_name = "searxng_search"
-                        result = (
-                            "Searches are now closed. You have search results with URLs. "
-                            "Use web_scrape to read the full content of the most relevant URLs, "
-                            "or synthesize your answer from what you already have."
-                        )
-                        blocked = True
-                    elif turn_search_count[0] > MAX_PARALLEL_SEARCHES:
+                    turn_search_count += 1
+                    if turn_search_count > MAX_PARALLEL_SEARCHES:
                         tool_name = "searxng_search"
                         result = (
                             f"Parallel search limit reached ({MAX_PARALLEL_SEARCHES} per turn). "
@@ -484,7 +465,7 @@ def ask_followup(
                         search_count[0] += 1
                         tool_name, result = ("searxng_search", _web_search(args.get("query", "").strip()))
                 else:
-                    tool_name, result = _execute_tool_call(tool_call, search_count)
+                    tool_name, result = _execute_tool_call(tool_call)
 
                 # Build display info based on tool type (skip blocked calls from UI)
                 if not blocked:
@@ -513,29 +494,7 @@ def ask_followup(
             # Store tool call info for this iteration
             tool_calls_list.extend(tool_call_info)
 
-            # After the first iteration with searches, lock searches so subsequent
-            # iterations can only scrape or answer.
-            if search_count[0] > 0:
-                searches_done[0] = True
-
-            # Enforce search -> scrape pattern: if this iteration was all searches and we've
-            # already done searches before, inject a corrective reminder forcing web_scrape.
-            tool_names_this_iter = [d["tool"] for d in tool_call_info]
-            if (
-                all(t == "searxng_search" for t in tool_names_this_iter)
-                and search_count[0] >= 2
-            ):
-                reminder = (
-                    "\u26a0 REMINDER: You already have search results with URLs. "
-                    "STOP searching and use web_scrape to read the full content of at least "
-                    "2-3 of the most relevant URLs from your search results. "
-                    "Do not issue any more searxng_search calls until you have scraped content."
-                )
-                messages.append({
-                    "role": "user",
-                    "content": reminder,
-                })
-
+            # (No additional limiting — MAX_SEARCHES + MAX_PARALLEL_SEARCHES + system prompt is sufficient)
             continue  # Loop back to call LLM again with tool results
 
         # Text response - done
@@ -555,7 +514,7 @@ def ask_followup(
     # Exceeded max iterations - call LLM one final time with accumulated context (no tools)
     # Add a final instruction to force a text response
     messages.append({
-        "role": "user",
+        "role": "system",
         "content": (
             "Please provide your final answer now based on the research results above. "
             "Do not make any more tool calls — just write your answer."

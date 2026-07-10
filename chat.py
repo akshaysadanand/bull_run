@@ -68,6 +68,7 @@ MAX_SEARCH_ITERATIONS = 3
 MAX_CHAT_TURNS = 10
 MAX_SEARCHES = 3  # Hard cap on searxng_search calls per question
 MAX_PARALLEL_SEARCHES = 2  # Max searxng_search calls the LLM can make in a single turn
+MAX_SCRAPE_CONTENT_LENGTH = 4000  # Truncate scraped page content to limit context size
 
 # LLM tool definitions - names match the MCP server's tool names
 WEB_SEARCH_TOOL = {
@@ -246,10 +247,13 @@ def _web_scrape(url: str) -> str:
         url: The URL to scrape.
 
     Returns:
-        Text content from the page.
+        Text content from the page, truncated to MAX_SCRAPE_CONTENT_LENGTH.
     """
     mcp = _MCPClient.get()
-    return mcp.call_tool("web_scrape", {"url": url})
+    result = mcp.call_tool("web_scrape", {"url": url})
+    if len(result) > MAX_SCRAPE_CONTENT_LENGTH:
+        result = result[:MAX_SCRAPE_CONTENT_LENGTH] + "\n\n[Content truncated — showing first ~4000 characters]"
+    return result
 
 
 def _build_system_prompt(

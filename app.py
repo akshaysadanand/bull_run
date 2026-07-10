@@ -83,6 +83,8 @@ if "chat_tool_calls" not in st.session_state:
     st.session_state.chat_tool_calls = []
 if "chat_pending" not in st.session_state:
     st.session_state.chat_pending = None
+if "chat_thinking" not in st.session_state:
+    st.session_state.chat_thinking = {}  # Maps message index -> thinking content
 
 # --- Warm MCP server for chat (non-blocking background init) ---
 if "mcp_warmed" not in st.session_state:
@@ -230,6 +232,7 @@ def on_get_news():
     st.session_state.chat_history = []
     st.session_state.chat_tool_calls = []
     st.session_state.chat_pending = None
+    st.session_state.chat_thinking = {}
     st.session_state.progress_step = 1
     st.session_state.progress_messages = []
     st.session_state.progress_done = False
@@ -471,25 +474,33 @@ st.divider()
 st.header("💬 Ask about " + (ticker if ticker else "..."))
 
 if ticker:
-    # Render chat history
-    for msg in st.session_state.chat_history:
+    # Render chat history using native chat containers
+    for i, msg in enumerate(st.session_state.chat_history):
         if msg["role"] == "user":
-            st.markdown(f"**You:** {msg['content']}")
+            with st.chat_message("user"):
+                st.markdown(msg["content"])
         elif msg["role"] == "assistant":
-            st.markdown(f"**Assistant:** {msg['content']}")
+            with st.chat_message("assistant"):
+                st.markdown(msg["content"])
+                # Show thinking if we stored it for this message
+                thinking = st.session_state.chat_thinking.get(i, "")
+                if thinking:
+                    with st.expander("🧠 Model's Reasoning Process"):
+                        st.markdown(thinking)
 
-    # Process pending question (non-streaming)
+    # Process pending question with research + streaming
     if st.session_state.chat_pending:
-        from chat import ask_followup, strip_thinking_tags
+        from chat import _run_tool_loop, stream_final_answer, strip_thinking_tags, _strip_tool_call_xml
 
         pending = st.session_state.chat_pending
 
-        # Show user's question immediately
-        st.markdown(f"**You:** {pending['question']}")
+        # Show user's question
+        with st.chat_message("user"):
+            st.markdown(pending["question"])
 
-        # Show research status while processing
-        with st.status("🔍 Researching...", expanded=False) as status:
-            result = ask_followup(
+        # Phase 1: Research (tool-calling loop with live status)
+        with st.status("🔍 Researching...", expanded=True) as status:
+            research = _run_tool_loop(
                 question=pending["question"],
                 ticker=pending["ticker"],
                 history=pending["history"],
@@ -500,9 +511,8 @@ if ticker:
             )
 
             # Show tool calls made during research
-            if result["tool_calls"]:
-                status.markdown("**Tool calls made:**")
-                for i, tc in enumerate(result["tool_calls"], 1):
+            if research["tool_calls"]:
+                for i, tc in enumerate(research["tool_calls"], 1):
                     tool = tc.get("tool", "unknown")
                     if tool == "searxng_search":
                         status.markdown(f"{i}. 🔎 web_search — `{tc.get('query', '')}`")
@@ -512,48 +522,84 @@ if ticker:
                         status.markdown(f"{i}. 📄 web_scrape — `{display_url}`")
                     else:
                         status.markdown(f"{i}. {tool}")
-        st.session_state.chat_tool_calls = result["tool_calls"]
 
-        # Strip thinking tags from answer (uses centralized function from chat.py)
-        full_answer = result["answer"] or ""
-        full_answer, thinking = strip_thinking_tags(full_answer)
+            if research["needs_final_call"]:
+                status.update(label="✍️ Writing answer...", state="running")
+            else:
+                status.update(label="✅ Research complete", state="complete")
 
-        # Render answer as proper markdown
-        st.markdown("**Assistant:**")
-        if full_answer:
-            st.markdown(full_answer)
+        st.session_state.chat_tool_calls = research["tool_calls"]
 
-        # Show thinking in collapsible expander if present
-        if thinking:
-            with st.expander("🧠 Model's Reasoning Process"):
-                st.markdown(thinking)
+        # Phase 2: Generate answer
+        with st.chat_message("assistant"):
+            if research["needs_final_call"]:
+                # Stream the final answer
+                answer_placeholder = st.empty()
+                raw_chunks = []
+                for chunk in stream_final_answer(
+                    research["messages"], pending["llm_url"], pending["model"]
+                ):
+                    raw_chunks.append(chunk)
+                    # Show accumulated text (raw, including any thinking tags)
+                    answer_placeholder.markdown("".join(raw_chunks) + "▌")
+
+                raw_answer = "".join(raw_chunks)
+                full_answer, thinking = strip_thinking_tags(raw_answer)
+                full_answer = _strip_tool_call_xml(full_answer)
+                if not full_answer:
+                    full_answer = "Search limit reached. I'll provide my best answer with the information I have."
+
+                # Re-render cleaned answer (replaces raw streamed content)
+                answer_placeholder.markdown(full_answer)
+            else:
+                # Already have the answer from the tool loop
+                full_answer = research["answer"]
+                full_answer, thinking = strip_thinking_tags(full_answer)
+                full_answer = _strip_tool_call_xml(full_answer)
+                st.markdown(full_answer)
+                thinking = ""  # thinking was already stripped in _run_tool_loop
+
+            # Show thinking in collapsible expander if present
+            if thinking:
+                with st.expander("🧠 Model's Reasoning Process"):
+                    st.markdown(thinking)
 
         # Save to history
         st.session_state.chat_history = pending["history"] + [
             {"role": "user", "content": pending["question"]},
             {"role": "assistant", "content": full_answer},
         ]
+        # Store thinking for history re-rendering
+        if thinking:
+            assistant_idx = len(st.session_state.chat_history) - 1
+            st.session_state.chat_thinking[assistant_idx] = thinking
         st.session_state.chat_pending = None
 
     # Render tool calls from last response (if any, and not currently streaming)
     elif st.session_state.chat_tool_calls:
         with st.expander("🔧 Tool Calls Made", expanded=False):
             for i, tc in enumerate(st.session_state.chat_tool_calls, 1):
-                st.markdown(f"**{i}. web_search** — `{tc.get('query', '')}`")
+                tool = tc.get("tool", "unknown")
+                if tool == "searxng_search":
+                    st.markdown(f"**{i}. 🔎 web_search** — `{tc.get('query', '')}`")
+                elif tool == "web_scrape":
+                    url = tc.get("url", "")
+                    display_url = url[:80] + "..." if len(url) > 80 else url
+                    st.markdown(f"**{i}. 📄 web_scrape** — `{display_url}`")
+                else:
+                    st.markdown(f"**{i}. {tool}**")
                 tc_result = tc.get("result", "")
                 if tc_result:
-                    with st.expander("Result"):
-                        st.markdown(tc_result)
+                    with st.expander(f"Result ({tool})"):
+                        st.text(tc_result[:2000])  # Cap display length
 
-    # Chat input (Enter to send)
-    is_chatting = st.session_state.chat_pending is not None
-    st.text_input(
-        "Ask a follow-up question",
-        key="chat_input",
-        placeholder="e.g., What about regulatory risks? Summarize only earnings-related articles.",
-        disabled=not ticker or is_chatting,
-        on_change=on_chat_send,
-    )
+    # Chat input
+    if prompt := st.chat_input(
+        "Ask a follow-up question...",
+        disabled=not ticker or st.session_state.chat_pending is not None,
+    ):
+        st.session_state.chat_input = prompt
+        on_chat_send()
 else:
     st.info("Enter a ticker to start chatting.")
 

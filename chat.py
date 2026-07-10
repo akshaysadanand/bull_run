@@ -324,12 +324,7 @@ def _execute_tool_call(tool_call) -> tuple[str, str]:
     name = tool_call.function.name
     args = json.loads(tool_call.function.arguments)
 
-    if name == "searxng_search":
-        query = args.get("query", "").strip()
-        if not query:
-            return ("searxng_search", "Error: query parameter is required and cannot be empty.")
-        return ("searxng_search", _web_search(query))
-    elif name == "web_scrape":
+    if name == "web_scrape":
         url = args.get("url", "").strip()
         if not url:
             return ("web_scrape", "Error: url parameter is required and cannot be empty.")
@@ -369,7 +364,7 @@ def ask_followup(
     tool_calls_list = []
 
     # Track search count to enforce MAX_SEARCHES limit
-    search_count = [0]
+    search_count = 0
 
     client = OpenAI(base_url=llm_url, api_key="not-needed", timeout=120.0)
     system_prompt = _build_system_prompt(ticker, articles, summary)
@@ -453,7 +448,7 @@ def ask_followup(
                             "Process the results you already have — use web_scrape on the URLs found."
                         )
                         blocked = True
-                    elif search_count[0] >= MAX_SEARCHES:
+                    elif search_count >= MAX_SEARCHES:
                         tool_name = "searxng_search"
                         result = (
                             f"Search limit reached ({MAX_SEARCHES}/{MAX_SEARCHES}). "
@@ -462,7 +457,7 @@ def ask_followup(
                         )
                         blocked = True
                     else:
-                        search_count[0] += 1
+                        search_count += 1
                         tool_name, result = ("searxng_search", _web_search(args.get("query", "").strip()))
                 else:
                     tool_name, result = _execute_tool_call(tool_call)

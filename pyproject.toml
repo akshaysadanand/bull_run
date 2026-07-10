@@ -11,6 +11,12 @@ dependencies = [
     "mcp>=1.28.1",
 ]
 
+[tool.setuptools]
+py-modules = ["app", "chat", "cli", "scraper", "summarizer"]
+
+[project.scripts]
+bullrun = "cli:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",

@@ -83,8 +83,6 @@ if "chat_tool_calls" not in st.session_state:
     st.session_state.chat_tool_calls = []
 if "chat_pending" not in st.session_state:
     st.session_state.chat_pending = None
-if "chat_thinking" not in st.session_state:
-    st.session_state.chat_thinking = {}  # Maps message index -> thinking content
 
 # --- Warm MCP server for chat (non-blocking background init) ---
 if "mcp_warmed" not in st.session_state:
@@ -232,7 +230,6 @@ def on_get_news():
     st.session_state.chat_history = []
     st.session_state.chat_tool_calls = []
     st.session_state.chat_pending = None
-    st.session_state.chat_thinking = {}
     st.session_state.progress_step = 1
     st.session_state.progress_messages = []
     st.session_state.progress_done = False
@@ -482,15 +479,35 @@ if ticker:
         elif msg["role"] == "assistant":
             with st.chat_message("assistant"):
                 st.markdown(msg["content"])
-                # Show thinking if we stored it for this message
-                thinking = st.session_state.chat_thinking.get(i, "")
+
+                # Render historical thinking (prefer from message, fallback to legacy chat_thinking dict)
+                thinking = msg.get("thinking", getattr(st.session_state, "chat_thinking", {}).get(i, ""))
                 if thinking:
                     with st.expander("🧠 Model's Reasoning Process"):
                         st.markdown(thinking)
 
+                # Render historical tool calls
+                tool_calls = msg.get("tool_calls", [])
+                if tool_calls:
+                    with st.expander("🔧 Tool Calls Made", expanded=False):
+                        for j, tc in enumerate(tool_calls, 1):
+                            tool = tc.get("tool", "unknown")
+                            if tool == "searxng_search":
+                                st.markdown(f"**{j}. 🔎 web_search** — `{tc.get('query', '')}`")
+                            elif tool == "web_scrape":
+                                url = tc.get("url", "")
+                                display_url = url[:80] + "..." if len(url) > 80 else url
+                                st.markdown(f"**{j}. 📄 web_scrape** — `{display_url}`")
+                            else:
+                                st.markdown(f"**{j}. {tool}**")
+                            tc_result = tc.get("result", "")
+                            if tc_result:
+                                with st.expander(f"Result ({tool})"):
+                                    st.text(tc_result[:2000])
+
     # Process pending question with research + streaming
     if st.session_state.chat_pending:
-        from chat import _run_tool_loop, stream_final_answer, strip_thinking_tags, _strip_tool_call_xml
+        from chat import run_tool_loop_stream, stream_final_answer, strip_thinking_tags, _strip_tool_call_xml
 
         pending = st.session_state.chat_pending
 
@@ -498,99 +515,109 @@ if ticker:
         with st.chat_message("user"):
             st.markdown(pending["question"])
 
-        # Phase 1: Research (tool-calling loop with live status)
-        with st.status("🔍 Researching...", expanded=True) as status:
-            research = _run_tool_loop(
-                question=pending["question"],
-                ticker=pending["ticker"],
-                history=pending["history"],
-                llm_url=pending["llm_url"],
-                model=pending["model"],
-                articles=pending["articles"],
-                summary=pending["summary"],
-            )
+        # Containers for streaming output
+        status_container = st.container()
+        assistant_container = st.chat_message("assistant")
 
-            # Show tool calls made during research
-            if research["tool_calls"]:
-                for i, tc in enumerate(research["tool_calls"], 1):
-                    tool = tc.get("tool", "unknown")
+        with status_container:
+            status = st.status("🔍 Researching...", expanded=True)
+
+        with assistant_container:
+            thinking_expander = st.expander("🧠 Model's Reasoning Process")
+            thinking_placeholder = thinking_expander.empty()
+            answer_placeholder = st.empty()
+
+        research = None
+        tool_counter = 1
+
+        # Phase 1: Research (Streaming)
+        try:
+            for event in run_tool_loop_stream(
+                question=pending["question"], ticker=pending["ticker"], history=pending["history"],
+                llm_url=pending["llm_url"], model=pending["model"], articles=pending["articles"], summary=pending["summary"]
+            ):
+                if event["type"] == "content_chunk":
+                    raw_text = event["full_content"]
+                    # Live extract and update thinking / answer
+                    cleaned, thinking = strip_thinking_tags(raw_text)
+                    if thinking:
+                        thinking_placeholder.markdown(thinking + "▌")
+                    if cleaned:
+                        answer_placeholder.markdown(cleaned + "▌")
+                elif event["type"] == "tool_start":
+                    tool = event["tool"]
+                    args = event["args"]
                     if tool == "searxng_search":
-                        status.markdown(f"{i}. 🔎 web_search — `{tc.get('query', '')}`")
+                        status.markdown(f"{tool_counter}. 🔎 web_search — `{args.get('query', '')}`")
                     elif tool == "web_scrape":
-                        url = tc.get("url", "")
+                        url = args.get("url", "")
                         display_url = url[:80] + "..." if len(url) > 80 else url
-                        status.markdown(f"{i}. 📄 web_scrape — `{display_url}`")
-                    else:
-                        status.markdown(f"{i}. {tool}")
+                        status.markdown(f"{tool_counter}. 📄 web_scrape — `{display_url}`")
+                    tool_counter += 1
+                elif event["type"] == "done":
+                    research = event
+                elif event["type"] == "error":
+                    status.update(label="❌ Error", state="error")
+                    answer_placeholder.markdown(f"Error: {event['error']}")
+                    st.session_state.chat_pending = None
+                    st.rerun()
+        except Exception as e:
+            status.update(label="❌ Error", state="error")
+            answer_placeholder.markdown(f"Research error: {e}")
+            st.session_state.chat_pending = None
+            st.rerun()
 
-            if research["needs_final_call"]:
-                status.update(label="✍️ Writing answer...", state="running")
-            else:
-                status.update(label="✅ Research complete", state="complete")
+        if research is None:
+            answer_placeholder.markdown("Research failed — no response received.")
+            status.update(label="❌ Research failed", state="error")
+            st.session_state.chat_pending = None
+            st.rerun()
 
         st.session_state.chat_tool_calls = research["tool_calls"]
 
-        # Phase 2: Generate answer
-        with st.chat_message("assistant"):
-            if research["needs_final_call"]:
-                # Stream the final answer
-                answer_placeholder = st.empty()
-                raw_chunks = []
-                for chunk in stream_final_answer(
-                    research["messages"], pending["llm_url"], pending["model"]
-                ):
+        # Final answer logic
+        if research["needs_final_call"]:
+            status.update(label="✍️ Writing answer...", state="running")
+            raw_chunks = []
+            try:
+                for chunk in stream_final_answer(research["messages"], pending["llm_url"], pending["model"]):
                     raw_chunks.append(chunk)
-                    # Show accumulated text (raw, including any thinking tags)
-                    answer_placeholder.markdown("".join(raw_chunks) + "▌")
+                    raw_text = "".join(raw_chunks)
+                    cleaned, thinking = strip_thinking_tags(raw_text)
+                    if thinking:
+                        thinking_placeholder.markdown(thinking + "▌")
+                    answer_placeholder.markdown(cleaned + "▌")
+            except Exception as e:
+                status.update(label="❌ Error writing answer", state="error")
+                answer_placeholder.markdown(f"Error generating answer: {e}")
+                st.session_state.chat_pending = None
+                st.rerun()
 
-                raw_answer = "".join(raw_chunks)
-                full_answer, thinking = strip_thinking_tags(raw_answer)
-                full_answer = _strip_tool_call_xml(full_answer)
-                if not full_answer:
-                    full_answer = "Search limit reached. I'll provide my best answer with the information I have."
+            raw_answer = "".join(raw_chunks)
+            full_answer, thinking = strip_thinking_tags(raw_answer)
+            full_answer = _strip_tool_call_xml(full_answer)
+            if not full_answer:
+                full_answer = "Search limit reached. I'll provide my best answer with the information I have."
+        else:
+            full_answer = research["answer"]
+            thinking = research.get("thinking", "")
 
-                # Re-render cleaned answer (replaces raw streamed content)
-                answer_placeholder.markdown(full_answer)
-            else:
-                # Already have the answer from the tool loop (thinking already stripped)
-                full_answer = research["answer"]
-                st.markdown(full_answer)
-                thinking = research.get("thinking", "")
+        status.update(label="✅ Research complete", state="complete")
 
-            # Show thinking in collapsible expander if present
-            if thinking:
-                with st.expander("🧠 Model's Reasoning Process"):
-                    st.markdown(thinking)
+        if thinking:
+            thinking_placeholder.markdown(thinking)
+        else:
+            # Hide the expander if empty (Streamlit doesn't support hiding directly, but empty text is fine)
+            pass
+        answer_placeholder.markdown(full_answer)
 
         # Save to history
         st.session_state.chat_history = pending["history"] + [
             {"role": "user", "content": pending["question"]},
-            {"role": "assistant", "content": full_answer},
+            {"role": "assistant", "content": full_answer, "tool_calls": st.session_state.chat_tool_calls, "thinking": thinking},
         ]
-        # Store thinking for history re-rendering
-        if thinking:
-            assistant_idx = len(st.session_state.chat_history) - 1
-            st.session_state.chat_thinking[assistant_idx] = thinking
         st.session_state.chat_pending = None
         st.rerun()
-
-    # Render tool calls from last response (if any, and not currently streaming)
-    elif st.session_state.chat_tool_calls:
-        with st.expander("🔧 Tool Calls Made", expanded=False):
-            for i, tc in enumerate(st.session_state.chat_tool_calls, 1):
-                tool = tc.get("tool", "unknown")
-                if tool == "searxng_search":
-                    st.markdown(f"**{i}. 🔎 web_search** — `{tc.get('query', '')}`")
-                elif tool == "web_scrape":
-                    url = tc.get("url", "")
-                    display_url = url[:80] + "..." if len(url) > 80 else url
-                    st.markdown(f"**{i}. 📄 web_scrape** — `{display_url}`")
-                else:
-                    st.markdown(f"**{i}. {tool}**")
-                tc_result = tc.get("result", "")
-                if tc_result:
-                    with st.expander(f"Result ({tool})"):
-                        st.text(tc_result[:2000])  # Cap display length
 
     # Chat input
     if prompt := st.chat_input(

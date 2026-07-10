@@ -8,6 +8,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 from mcp.client.session import ClientSession
@@ -23,7 +24,7 @@ MAX_SEARCH_ITERATIONS = 3
 MAX_CHAT_TURNS = 10
 MAX_SEARCHES = 3  # Hard cap on searxng_search calls per question
 MAX_PARALLEL_SEARCHES = 2  # Max searxng_search calls the LLM can make in a single turn
-MAX_SCRAPE_CONTENT_LENGTH = 4000  # Truncate scraped page content to limit context size
+MAX_SCRAPE_CONTENT_LENGTH = 10000  # Truncate scraped page content to limit context size
 
 
 def _strip_tool_call_xml(text: str) -> str:
@@ -576,6 +577,229 @@ def _run_tool_loop(
         "tool_calls": tool_calls_list,
         "trimmed_history": trimmed_history,
         "answer": None,
+        "needs_final_call": True,
+    }
+
+
+def run_tool_loop_stream(
+    question: str,
+    ticker: str,
+    history: list[dict],
+    llm_url: str,
+    model: str,
+    articles: Optional[list[dict]] = None,
+    summary: Optional[str] = None,
+):
+    """Streaming generator that yields events as the LLM researches and answers.
+
+    Uses `stream=True` with the OpenAI client to provide real-time updates
+    on content chunks, tool calls, and final results.
+
+    Args:
+        question: User's question.
+        ticker: Stock ticker symbol.
+        history: Prior chat messages [{role, content}, ...].
+        llm_url: OpenAI-compatible LLM base URL.
+        model: Model name.
+        articles: Optional scraped articles for context.
+        summary: Optional initial summary for context.
+
+    Yields:
+        Dict events with types:
+        - {"type": "content_chunk", "chunk": delta_content, "full_content": accumulated}
+        - {"type": "tool_start", "tool": tool_name, "args": parsed_args_dict}
+        - {"type": "tool_result", "tool": tool_name, "result": result_text}
+        - {"type": "done", "messages": ..., "tool_calls": ..., "trimmed_history": ...,
+           "answer": ..., "thinking": ..., "needs_final_call": ...}
+        - {"type": "error", "error": error_message}
+    """
+    tool_calls_list = []
+    search_count = 0
+
+    client = OpenAI(base_url=llm_url, api_key="not-needed", timeout=120.0)
+    system_prompt = _build_system_prompt(ticker, articles, summary)
+
+    messages = [{"role": "system", "content": system_prompt}]
+
+    trimmed_history = history[-(MAX_CHAT_TURNS * 2):] if len(history) > MAX_CHAT_TURNS * 2 else history
+    # Only keep role and content for API compatibility, drop tool_calls/thinking metadata
+    clean_history = [{"role": m["role"], "content": m["content"]} for m in trimmed_history]
+    messages.extend(clean_history)
+    messages.append({"role": "user", "content": question})
+
+    for iteration in range(MAX_SEARCH_ITERATIONS):
+        try:
+            stream = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=TOOLS,
+                temperature=0.1,
+                stream=True,
+            )
+        except Exception as e:
+            logger.exception("LLM call failed")
+            yield {"type": "error", "error": str(e)}
+            return
+
+        current_content = ""
+        current_tool_calls = []
+
+        # Consume the streaming response
+        for chunk in stream:
+            delta = chunk.choices[0].delta
+            if delta.content:
+                current_content += delta.content
+                yield {"type": "content_chunk", "chunk": delta.content, "full_content": current_content}
+
+            if delta.tool_calls:
+                for tc_chunk in delta.tool_calls:
+                    while len(current_tool_calls) <= tc_chunk.index:
+                        current_tool_calls.append({
+                            "id": "",
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""}
+                        })
+                    tc = current_tool_calls[tc_chunk.index]
+                    if tc_chunk.id:
+                        tc["id"] += tc_chunk.id
+                    if tc_chunk.function.name:
+                        tc["function"]["name"] += tc_chunk.function.name
+                    if tc_chunk.function.arguments:
+                        tc["function"]["arguments"] += tc_chunk.function.arguments
+
+        # If tool calls detected, execute them and loop back
+        if current_tool_calls:
+            assistant_msg = {
+                "role": "assistant",
+                "tool_calls": current_tool_calls,
+            }
+            if current_content:
+                assistant_msg["content"] = current_content
+            messages.append(assistant_msg)
+
+            # Separate searches (rate-limited) from scrapes (parallelizable)
+            search_calls = [tc for tc in current_tool_calls if tc["function"]["name"] == "searxng_search"]
+            other_calls = [tc for tc in current_tool_calls if tc["function"]["name"] != "searxng_search"]
+
+            turn_search_count = 0
+            tool_results = {}  # tc_id -> (tool_name, result, args, blocked)
+
+            # Execute searches sequentially (to enforce limits)
+            for tc in search_calls:
+                args = json.loads(tc["function"]["arguments"])
+                turn_search_count += 1
+                if turn_search_count > MAX_PARALLEL_SEARCHES:
+                    tool_results[tc["id"]] = (
+                        "searxng_search",
+                        f"Parallel search limit reached ({MAX_PARALLEL_SEARCHES} per turn). "
+                        "Process the results you already have — use web_scrape on the URLs found.",
+                        args,
+                        True,  # blocked
+                    )
+                elif search_count >= MAX_SEARCHES:
+                    tool_results[tc["id"]] = (
+                        "searxng_search",
+                        f"Search limit reached ({MAX_SEARCHES}/{MAX_SEARCHES}). "
+                        "STOP searching. Use web_scrape to read the full content of URLs from your previous "
+                        "search results instead.",
+                        args,
+                        True,  # blocked
+                    )
+                else:
+                    search_count += 1
+                    yield {"type": "tool_start", "tool": "searxng_search", "args": args}
+                    result = _web_search(args.get("query", "").strip())
+                    yield {"type": "tool_result", "tool": "searxng_search", "result": result}
+                    tool_results[tc["id"]] = ("searxng_search", result, args, False)
+
+            # Execute scrapes and other tools in parallel
+            if other_calls:
+                for tc in other_calls:
+                    args = json.loads(tc["function"]["arguments"])
+                    yield {"type": "tool_start", "tool": tc["function"]["name"], "args": args}
+
+                with ThreadPoolExecutor(max_workers=3) as executor:
+                    future_to_tc = {
+                        executor.submit(
+                            _execute_tool_call,
+                            SimpleNamespace(
+                                function=SimpleNamespace(
+                                    name=tc["function"]["name"],
+                                    arguments=tc["function"]["arguments"],
+                                )
+                            ),
+                        ): tc
+                        for tc in other_calls
+                    }
+                    for future in as_completed(future_to_tc):
+                        tc = future_to_tc[future]
+                        args = json.loads(tc["function"]["arguments"])
+                        try:
+                            tool_name, result = future.result()
+                        except Exception as e:
+                            tool_name = tc["function"]["name"]
+                            result = f"Tool execution failed: {e}"
+                        yield {"type": "tool_result", "tool": tool_name, "result": result}
+                        tool_results[tc["id"]] = (tool_name, result, args, False)
+
+            # Build tool call display info and append tool result messages (in original order)
+            for tc in current_tool_calls:
+                tool_name, result, args, blocked = tool_results[tc["id"]]
+
+                if not blocked:
+                    if tool_name == "searxng_search":
+                        display = {
+                            "tool": "searxng_search",
+                            "query": args.get("query", ""),
+                            "result": result,
+                        }
+                    elif tool_name == "web_scrape":
+                        display = {
+                            "tool": "web_scrape",
+                            "url": args.get("url", ""),
+                            "result": result,
+                        }
+                    else:
+                        display = {"tool": tool_name, "result": result}
+                    tool_calls_list.append(display)
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": result,
+                })
+
+            continue
+
+        # Text response — done
+        cleaned, thinking = strip_thinking_tags(current_content)
+        cleaned = _strip_tool_call_xml(cleaned)
+        yield {
+            "type": "done",
+            "messages": messages,
+            "tool_calls": tool_calls_list,
+            "trimmed_history": trimmed_history,
+            "answer": cleaned,
+            "thinking": thinking,
+            "needs_final_call": False,
+        }
+        return
+
+    # Exceeded max iterations — need a final call to get the answer
+    messages.append({
+        "role": "system",
+        "content": (
+            "Please provide your final answer now based on the research results above. "
+            "Do not make any more tool calls — just write your answer."
+        ),
+    })
+    yield {
+        "type": "done",
+        "messages": messages,
+        "tool_calls": tool_calls_list,
+        "trimmed_history": trimmed_history,
+        "answer": None,
+        "thinking": "",
         "needs_final_call": True,
     }
 

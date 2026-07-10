@@ -62,6 +62,7 @@ def strip_thinking_tags(text: str) -> tuple[str, str]:
     # Catch trailing unclosed <think> blocks — negative lookahead ensures we skip
     # blocks that already have a closing tag (avoiding double-extraction)
     trailing = re.findall(r'<think>(?!.*</think>)(.*?)$', text, flags=re.DOTALL | re.IGNORECASE)
+    trailing += re.findall(r'<thinking>(?!.*</thinking>)(.*?)$', text, flags=re.DOTALL | re.IGNORECASE)
     thinking_parts += trailing
 
     thinking = "\n".join(p.strip() for p in thinking_parts if p.strip())
@@ -70,6 +71,7 @@ def strip_thinking_tags(text: str) -> tuple[str, str]:
     cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE)
     cleaned = re.sub(r'<thinking>.*?</thinking>', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
     cleaned = re.sub(r'\s*<think>.*$', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r'\s*<thinking>.*$', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
 
     return cleaned.strip(), thinking
 
@@ -627,6 +629,8 @@ def run_tool_loop_stream(
     messages.extend(clean_history)
     messages.append({"role": "user", "content": question})
 
+    total_thinking = ""
+
     for iteration in range(MAX_SEARCH_ITERATIONS):
         try:
             stream = client.chat.completions.create(
@@ -645,12 +649,38 @@ def run_tool_loop_stream(
         current_tool_calls = []
 
         # Consume the streaming response
+        is_thinking = False
         for chunk in stream:
             delta = chunk.choices[0].delta
+            
+            # Support vLLM/OpenRouter reasoning_content natively
+            r_content = getattr(delta, "reasoning_content", None)
+            if not r_content and hasattr(delta, "model_extra") and delta.model_extra:
+                r_content = delta.model_extra.get("reasoning_content")
+                
+            content_to_add = ""
+            if r_content:
+                if not is_thinking:
+                    content_to_add += "<think>\n"
+                    is_thinking = True
+                content_to_add += r_content
+                
             if delta.content:
-                current_content += delta.content
-                yield {"type": "content_chunk", "chunk": delta.content, "full_content": current_content}
+                if is_thinking:
+                    content_to_add += "\n</think>\n"
+                    is_thinking = False
+                content_to_add += delta.content
 
+            if content_to_add:
+                current_content += content_to_add
+                _, current_thinking = strip_thinking_tags(current_content)
+                yield {
+                    "type": "content_chunk",
+                    "chunk": content_to_add,
+                    "full_content": current_content,
+                    "current_thinking": current_thinking,
+                }
+                
             if delta.tool_calls:
                 for tc_chunk in delta.tool_calls:
                     while len(current_tool_calls) <= tc_chunk.index:
@@ -667,8 +697,18 @@ def run_tool_loop_stream(
                     if tc_chunk.function.arguments:
                         tc["function"]["arguments"] += tc_chunk.function.arguments
 
+        if is_thinking:
+            current_content += "\n</think>\n"
+
         # If tool calls detected, execute them and loop back
         if current_tool_calls:
+            # Accumulate thinking from this iteration before resetting current_content
+            _, iteration_thinking = strip_thinking_tags(current_content)
+            if iteration_thinking:
+                if total_thinking:
+                    total_thinking += "\n" + iteration_thinking
+                else:
+                    total_thinking = iteration_thinking
             assistant_msg = {
                 "role": "assistant",
                 "tool_calls": current_tool_calls,
@@ -774,13 +814,17 @@ def run_tool_loop_stream(
         # Text response — done
         cleaned, thinking = strip_thinking_tags(current_content)
         cleaned = _strip_tool_call_xml(cleaned)
+        # Combine thinking from all iterations
+        full_thinking = total_thinking + ("\n" + thinking if total_thinking and thinking else "")
+        full_thinking = full_thinking or thinking
         yield {
             "type": "done",
             "messages": messages,
             "tool_calls": tool_calls_list,
             "trimmed_history": trimmed_history,
             "answer": cleaned,
-            "thinking": thinking,
+            "thinking": full_thinking,
+            "total_thinking": full_thinking,
             "needs_final_call": False,
         }
         return
@@ -799,7 +843,8 @@ def run_tool_loop_stream(
         "tool_calls": tool_calls_list,
         "trimmed_history": trimmed_history,
         "answer": None,
-        "thinking": "",
+        "thinking": total_thinking,
+        "total_thinking": total_thinking,
         "needs_final_call": True,
     }
 
@@ -826,10 +871,28 @@ def stream_final_answer(messages: list[dict], llm_url: str, model: str):
             temperature=0.1,
             stream=True,
         )
+        is_thinking = False
         for chunk in stream:
             delta = chunk.choices[0].delta
+            
+            r_content = getattr(delta, "reasoning_content", None)
+            if not r_content and hasattr(delta, "model_extra") and delta.model_extra:
+                r_content = delta.model_extra.get("reasoning_content")
+                
+            if r_content:
+                if not is_thinking:
+                    yield "<think>\n"
+                    is_thinking = True
+                yield r_content
+                
             if delta.content:
+                if is_thinking:
+                    yield "\n</think>\n"
+                    is_thinking = False
                 yield delta.content
+                
+        if is_thinking:
+            yield "\n</think>\n"
     except Exception as e:
         logger.exception("Streaming LLM call failed")
         yield f"LLM error: {e}"

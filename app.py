@@ -2,6 +2,7 @@
 
 import html
 import json
+import re
 from pathlib import Path
 
 import streamlit as st
@@ -9,6 +10,13 @@ from scraper import scrape_news
 from summarizer import summarize_news
 
 PRESETS_FILE = Path(__file__).parent / "presets.json"
+
+
+def escape_dollar_signs(text: str) -> str:
+    """Escapes $ signs followed by numbers to prevent Streamlit from rendering them as LaTeX."""
+    if not text:
+        return text
+    return re.sub(r'(?<!\\)\$(\d)', r'\\$\1', text)
 
 
 def load_presets() -> list[dict]:
@@ -321,13 +329,13 @@ def _render_summary(summary, summary_error, thinking, llm_url, model):
         st.info(f"Check that your LLM server is running at **{llm_url}** with model **{model}**")
     elif summary is not None:
         if summary.strip():
-            st.markdown(summary)
+            st.markdown(escape_dollar_signs(summary))
         else:
             st.warning("The LLM returned an empty summary. Try a different model or check your LLM server.")
 
         if thinking:
             with st.expander("🧠 Model's Reasoning Process"):
-                st.markdown(thinking)
+                st.markdown(escape_dollar_signs(thinking))
     else:
         st.info("Waiting for results...")
 
@@ -478,13 +486,13 @@ if ticker:
                 st.markdown(msg["content"])
         elif msg["role"] == "assistant":
             with st.chat_message("assistant"):
-                st.markdown(msg["content"])
+                st.markdown(escape_dollar_signs(msg["content"]))
 
                 # Render historical thinking (prefer from message, fallback to legacy chat_thinking dict)
                 thinking = msg.get("thinking", getattr(st.session_state, "chat_thinking", {}).get(i, ""))
                 if thinking:
                     with st.expander("🧠 Model's Reasoning Process"):
-                        st.markdown(thinking)
+                        st.markdown(escape_dollar_signs(thinking))
 
                 # Render historical tool calls
                 tool_calls = msg.get("tool_calls", [])
@@ -529,6 +537,7 @@ if ticker:
 
         research = None
         tool_counter = 1
+        total_thinking = ""
 
         # Phase 1: Research (Streaming)
         try:
@@ -538,12 +547,15 @@ if ticker:
             ):
                 if event["type"] == "content_chunk":
                     raw_text = event["full_content"]
-                    # Live extract and update thinking / answer
-                    cleaned, thinking = strip_thinking_tags(raw_text)
-                    if thinking:
-                        thinking_placeholder.markdown(thinking + "▌")
+                    current_thinking = event.get("current_thinking", "")
+                    # Accumulate thinking: previous iterations + current iteration
+                    combined_thinking = total_thinking + ("\n" + current_thinking if total_thinking and current_thinking else "")
+                    combined_thinking = combined_thinking or total_thinking or current_thinking
+                    cleaned, _ = strip_thinking_tags(raw_text)
+                    if combined_thinking:
+                        thinking_placeholder.markdown(escape_dollar_signs(combined_thinking) + "▌")
                     if cleaned:
-                        answer_placeholder.markdown(cleaned + "▌")
+                        answer_placeholder.markdown(escape_dollar_signs(cleaned) + "▌")
                 elif event["type"] == "tool_start":
                     tool = event["tool"]
                     args = event["args"]
@@ -556,6 +568,8 @@ if ticker:
                     tool_counter += 1
                 elif event["type"] == "done":
                     research = event
+                    # Persist total thinking from the done event
+                    total_thinking = event.get("total_thinking", event.get("thinking", ""))
                 elif event["type"] == "error":
                     status.update(label="❌ Error", state="error")
                     answer_placeholder.markdown(f"Error: {event['error']}")
@@ -585,8 +599,8 @@ if ticker:
                     raw_text = "".join(raw_chunks)
                     cleaned, thinking = strip_thinking_tags(raw_text)
                     if thinking:
-                        thinking_placeholder.markdown(thinking + "▌")
-                    answer_placeholder.markdown(cleaned + "▌")
+                        thinking_placeholder.markdown(escape_dollar_signs(thinking) + "▌")
+                    answer_placeholder.markdown(escape_dollar_signs(cleaned) + "▌")
             except Exception as e:
                 status.update(label="❌ Error writing answer", state="error")
                 answer_placeholder.markdown(f"Error generating answer: {e}")
@@ -594,22 +608,25 @@ if ticker:
                 st.rerun()
 
             raw_answer = "".join(raw_chunks)
-            full_answer, thinking = strip_thinking_tags(raw_answer)
+            full_answer, final_thinking = strip_thinking_tags(raw_answer)
             full_answer = _strip_tool_call_xml(full_answer)
             if not full_answer:
                 full_answer = "Search limit reached. I'll provide my best answer with the information I have."
+            # Combine thinking from research phase + final answer phase
+            thinking = total_thinking + ("\n" + final_thinking if total_thinking and final_thinking else "")
+            thinking = thinking or total_thinking or final_thinking
         else:
             full_answer = research["answer"]
-            thinking = research.get("thinking", "")
+            thinking = total_thinking or research.get("thinking", "")
 
         status.update(label="✅ Research complete", state="complete")
 
         if thinking:
-            thinking_placeholder.markdown(thinking)
+            thinking_placeholder.markdown(escape_dollar_signs(thinking))
         else:
             # Hide the expander if empty (Streamlit doesn't support hiding directly, but empty text is fine)
             pass
-        answer_placeholder.markdown(full_answer)
+        answer_placeholder.markdown(escape_dollar_signs(full_answer))
 
         # Save to history
         st.session_state.chat_history = pending["history"] + [

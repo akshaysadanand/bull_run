@@ -552,6 +552,7 @@ if ticker:
                     combined_thinking = total_thinking + ("\n" + current_thinking if total_thinking and current_thinking else "")
                     combined_thinking = combined_thinking or total_thinking or current_thinking
                     cleaned, _ = strip_thinking_tags(raw_text)
+                    cleaned = _strip_tool_call_xml(cleaned)
                     if combined_thinking:
                         thinking_placeholder.markdown(escape_dollar_signs(combined_thinking) + "▌")
                     if cleaned:
@@ -598,9 +599,11 @@ if ticker:
                     raw_chunks.append(chunk)
                     raw_text = "".join(raw_chunks)
                     cleaned, thinking = strip_thinking_tags(raw_text)
+                    cleaned = _strip_tool_call_xml(cleaned)
                     if thinking:
                         thinking_placeholder.markdown(escape_dollar_signs(thinking) + "▌")
-                    answer_placeholder.markdown(escape_dollar_signs(cleaned) + "▌")
+                    if cleaned:
+                        answer_placeholder.markdown(escape_dollar_signs(cleaned) + "▌")
             except Exception as e:
                 status.update(label="❌ Error writing answer", state="error")
                 answer_placeholder.markdown(f"Error generating answer: {e}")

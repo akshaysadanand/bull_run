@@ -6,7 +6,6 @@ import logging
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
@@ -14,15 +13,18 @@ from typing import Optional
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from openai import OpenAI
+from datetime import datetime
+
+from utils.prompts import SystemPrompts
 
 logger = logging.getLogger(__name__)
 
-CURRENT_YEAR = datetime.now().year
+CURRENT_DATE = datetime.now().strftime("%B %d, %Y")
 
 MCP_SERVER_DIR = Path.home() / "Projects" / "web-search-MCP"
-MAX_SEARCH_ITERATIONS = 3
+MAX_SEARCH_ITERATIONS = 10
 MAX_CHAT_TURNS = 10
-MAX_SEARCHES = 3  # Hard cap on searxng_search calls per question
+MAX_SEARCHES = 5  # Hard cap on searxng_search calls per question
 MAX_PARALLEL_SEARCHES = 2  # Max searxng_search calls the LLM can make in a single turn
 MAX_SCRAPE_CONTENT_LENGTH = 10000  # Truncate scraped page content to limit context size
 
@@ -38,8 +40,14 @@ def _strip_tool_call_xml(text: str) -> str:
     """
     # Match anything between sentinels: `<tool_call> ... _` (handles newlines, malformed XML, etc.)
     text = re.sub(r'\u2458.*?\u2459', '', text, flags=re.DOTALL)
-    # Match unclosed `<tool_call>` — strip everything from sentinel to end of string
+    # Match unclosed `<tool_call>` sentinel — strip everything from sentinel to end of string
     text = re.sub(r'\u2458.*$', '', text, flags=re.DOTALL | re.MULTILINE)
+    
+    # Also strip literal <tool_call> XML blocks
+    text = re.sub(r'<tool_call>.*?</tool_call>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    # Match unclosed literal <tool_call>
+    text = re.sub(r'<tool_call>.*$', '', text, flags=re.DOTALL | re.IGNORECASE | re.MULTILINE)
+    
     return text.strip()
 
 
@@ -162,8 +170,8 @@ class _MCPClient:
 
             try:
                 server_params = StdioServerParameters(
-                    command="uv",
-                    args=["--directory", str(MCP_SERVER_DIR), "run", "web-search-mcp"],
+                    command="bash",
+                    args=[str(MCP_SERVER_DIR / "start.sh")],
                 )
 
                 async def _init():
@@ -305,44 +313,27 @@ def _build_system_prompt(
     Returns:
         System prompt string tailored to available context.
     """
-    year_hint = f"Today's year is {CURRENT_YEAR}. When searching for upcoming events, earnings, or catalysts, " \
-                f"use queries that target {CURRENT_YEAR} and {CURRENT_YEAR + 1}."
-    tool_instructions = (
-        "\n\nRESEARCH WORKFLOW (strict — follow in order):\n"
-        "1. Do 1-2 searxng_search calls to find relevant URLs. Maximum 2 parallel searches per turn, 3 total.\n"
-        "2. Use web_scrape on 2-3 of the most relevant URLs from your search results.\n"
-        "3. Synthesize your answer from the scraped content, not from search snippets.\n\n"
-        "CRITICAL RULES:\n"
-        "- Search results only contain short snippets with URLs. You MUST use web_scrape to read full content.\n"
-        "- Never answer based solely on search snippets — always scrape at least 2-3 relevant pages first.\n"
-        "- After 2 searches, STOP searching and start scraping the URLs you found.\n"
-        "- Do NOT issue more than 3 searxng_search calls total. After that, only use web_scrape.\n"
-        "- For simple factual queries (prices, dates, tickers), 1 search is enough — don't over-search."
-    )
+    year_hint = SystemPrompts.YEAR_HINT.format(current_date=CURRENT_DATE)
+
     if articles and summary:
         articles_text = "\n".join(
-            f"- {a.get('title', 'Untitled')} ({a.get('source', 'Unknown')}, {a.get('date', '')})"
+            f"- {a.get('title', 'Untitled')} ({a.get('source', 'Unknown')}, {a.get('date', '')}) - URL: {a.get('url', 'N/A')}"
             for a in articles
         )
-        return (
-            f"You are a financial news analyst helping a user understand news about {ticker}.\n"
-            f"You have access to the following context:\n\n"
-            f"INITIAL SUMMARY:\n{summary}\n\n"
-            f"ARTICLES:\n{articles_text}\n\n"
-            f"{year_hint}\n\n"
-            f"Answer the user's question based on this context. "
-            f"If you need additional current information, follow the research workflow below.\n"
-            f"Be concise and cite sources when referencing specific claims."
-            f"{tool_instructions}"
+        return SystemPrompts.WITH_CONTEXT_TEMPLATE.format(
+            ticker=ticker,
+            summary=summary,
+            articles_text=articles_text,
+            year_hint=year_hint,
+            citation_rule=SystemPrompts.CITATION_RULE,
+            research_workflow=SystemPrompts.RESEARCH_WORKFLOW
         )
     else:
-        return (
-            f"You are a financial news analyst helping a user research {ticker}.\n"
-            f"{year_hint}\n\n"
-            f"Follow the research workflow below to answer the user's question.\n"
-            f"Be concise and cite sources when referencing specific claims."
-            f"Always cite the sources you used to form your answer, and include the URL of each source in your response."
-            f"{tool_instructions}"
+        return SystemPrompts.NO_CONTEXT_TEMPLATE.format(
+            ticker=ticker,
+            year_hint=year_hint,
+            citation_rule=SystemPrompts.CITATION_RULE,
+            research_workflow=SystemPrompts.RESEARCH_WORKFLOW
         )
 
 
@@ -426,7 +417,7 @@ def _run_tool_loop(
                 model=model,
                 messages=messages,
                 tools=TOOLS,
-                temperature=0.1,
+                temperature=0.6,
             )
         except Exception as e:
             logger.exception("LLM call failed, falling back to text-only")
@@ -434,7 +425,7 @@ def _run_tool_loop(
                 response = client.chat.completions.create(
                     model=model,
                     messages=messages,
-                    temperature=0.1,
+                    temperature=0.6,
                 )
             except Exception as e2:
                 return {
@@ -450,6 +441,14 @@ def _run_tool_loop(
         if message.tool_calls:
             tool_call_info = []
 
+            # Accumulate thinking from this iteration
+            cleaned_content, iteration_thinking = strip_thinking_tags(message.content or "")
+            if iteration_thinking:
+                if total_thinking:
+                    total_thinking += "\n" + iteration_thinking
+                else:
+                    total_thinking = iteration_thinking
+
             assistant_msg = {
                 "role": "assistant",
                 "tool_calls": [
@@ -464,8 +463,9 @@ def _run_tool_loop(
                     for tc in message.tool_calls
                 ],
             }
-            if message.content:
-                assistant_msg["content"] = message.content
+            # Save cleaned content to history to prevent reasoning context poisoning
+            if cleaned_content.strip():
+                assistant_msg["content"] = cleaned_content.strip()
             messages.append(assistant_msg)
 
             # Execute tool calls (parallel where possible, with search limiting)
@@ -637,7 +637,7 @@ def run_tool_loop_stream(
                 model=model,
                 messages=messages,
                 tools=TOOLS,
-                temperature=0.1,
+                temperature=0.6,
                 stream=True,
             )
         except Exception as e:
@@ -703,7 +703,7 @@ def run_tool_loop_stream(
         # If tool calls detected, execute them and loop back
         if current_tool_calls:
             # Accumulate thinking from this iteration before resetting current_content
-            _, iteration_thinking = strip_thinking_tags(current_content)
+            cleaned_content, iteration_thinking = strip_thinking_tags(current_content)
             if iteration_thinking:
                 if total_thinking:
                     total_thinking += "\n" + iteration_thinking
@@ -713,8 +713,9 @@ def run_tool_loop_stream(
                 "role": "assistant",
                 "tool_calls": current_tool_calls,
             }
-            if current_content:
-                assistant_msg["content"] = current_content
+            # Save cleaned content to history to prevent reasoning context poisoning
+            if cleaned_content.strip():
+                assistant_msg["content"] = cleaned_content.strip()
             messages.append(assistant_msg)
 
             # Separate searches (rate-limited) from scrapes (parallelizable)
@@ -868,7 +869,7 @@ def stream_final_answer(messages: list[dict], llm_url: str, model: str):
         stream = client.chat.completions.create(
             model=model,
             messages=messages,
-            temperature=0.1,
+            temperature=0.6,
             stream=True,
         )
         is_thinking = False

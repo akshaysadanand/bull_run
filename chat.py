@@ -374,8 +374,8 @@ def ask_followup(
     if not question.strip():
         return {"answer": "", "history": history, "tool_calls": []}
 
-    # Reset tool calls tracking for this invocation
-    ask_followup._tool_calls = []
+    # Track tool calls for this invocation
+    tool_calls_list = []
 
     # Track search count to enforce MAX_SEARCHES limit
     search_count = [0]
@@ -419,7 +419,7 @@ def ask_followup(
                     {"role": "user", "content": question},
                     {"role": "assistant", "content": error_answer},
                 ]
-                return {"answer": error_answer, "history": new_history, "tool_calls": ask_followup._tool_calls}
+                return {"answer": error_answer, "history": new_history, "tool_calls": tool_calls_list}
 
         message = response.choices[0].message
 
@@ -511,9 +511,7 @@ def ask_followup(
                 })
 
             # Store tool call info for this iteration
-            if not hasattr(ask_followup, "_tool_calls"):
-                ask_followup._tool_calls = []
-            ask_followup._tool_calls.extend(tool_call_info)
+            tool_calls_list.extend(tool_call_info)
 
             # After the first iteration with searches, lock searches so subsequent
             # iterations can only scrape or answer.
@@ -551,7 +549,7 @@ def ask_followup(
         return {
             "answer": answer,
             "history": new_history,
-            "tool_calls": ask_followup._tool_calls,
+            "tool_calls": tool_calls_list,
         }
 
     # Exceeded max iterations - call LLM one final time with accumulated context (no tools)
@@ -583,7 +581,7 @@ def ask_followup(
     return {
         "answer": answer,
         "history": new_history,
-        "tool_calls": ask_followup._tool_calls,
+        "tool_calls": tool_calls_list,
     }
 
 

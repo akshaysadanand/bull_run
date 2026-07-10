@@ -232,22 +232,32 @@ def test_ask_followup_rejects_whitespace_question():
 
 
 def test_ask_followup_handles_max_iterations():
-    """Verify ask_followup stops after MAX_SEARCH_ITERATIONS tool calls."""
+    """Verify ask_followup stops after MAX_SEARCH_ITERATIONS and streams final answer."""
     from chat import ask_followup, MAX_SEARCH_ITERATIONS
 
-    # LLM keeps requesting searches every time
+    # LLM keeps requesting searches every time during tool loop
     mock_tool_call = MagicMock()
     mock_tool_call.id = "call_123"
     mock_tool_call.type = "function"
     mock_tool_call.function.name = "searxng_search"
     mock_tool_call.function.arguments = '{"query": "test"}'
 
-    mock_response = MagicMock()
-    mock_response.choices[0].message.content = None
-    mock_response.choices[0].message.tool_calls = [mock_tool_call]
+    mock_tool_response = MagicMock()
+    mock_tool_response.choices[0].message.content = None
+    mock_tool_response.choices[0].message.tool_calls = [mock_tool_call]
+
+    # Streaming response for the final answer call (stream=True)
+    mock_stream_chunk = MagicMock()
+    mock_stream_chunk.choices[0].delta.content = "Final answer based on research."
+    mock_stream = iter([mock_stream_chunk])
+
+    def create_side_effect(**kwargs):
+        if kwargs.get("stream"):
+            return mock_stream
+        return mock_tool_response
 
     mock_client = MagicMock()
-    mock_client.chat.completions.create.return_value = mock_response
+    mock_client.chat.completions.create.side_effect = create_side_effect
 
     with patch("chat.OpenAI", return_value=mock_client):
         with patch("chat._web_search", return_value="Search results"):
@@ -259,9 +269,9 @@ def test_ask_followup_handles_max_iterations():
                 model="qwen",
             )
 
-    # Should have made MAX_SEARCH_ITERATIONS tool calls + 1 final call without tools
+    # Should have made MAX_SEARCH_ITERATIONS tool calls + 1 final streaming call
     assert mock_client.chat.completions.create.call_count == MAX_SEARCH_ITERATIONS + 1
-    assert result["answer"] != ""
+    assert result["answer"] == "Final answer based on research."
 
 
 # --- Tests for strip_thinking_tags ---

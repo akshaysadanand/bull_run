@@ -552,12 +552,10 @@ if ticker:
                 # Re-render cleaned answer (replaces raw streamed content)
                 answer_placeholder.markdown(full_answer)
             else:
-                # Already have the answer from the tool loop
+                # Already have the answer from the tool loop (thinking already stripped)
                 full_answer = research["answer"]
-                full_answer, thinking = strip_thinking_tags(full_answer)
-                full_answer = _strip_tool_call_xml(full_answer)
                 st.markdown(full_answer)
-                thinking = ""  # thinking was already stripped in _run_tool_loop
+                thinking = research.get("thinking", "")
 
             # Show thinking in collapsible expander if present
             if thinking:
@@ -574,6 +572,7 @@ if ticker:
             assistant_idx = len(st.session_state.chat_history) - 1
             st.session_state.chat_thinking[assistant_idx] = thinking
         st.session_state.chat_pending = None
+        st.rerun()
 
     # Render tool calls from last response (if any, and not currently streaming)
     elif st.session_state.chat_tool_calls:

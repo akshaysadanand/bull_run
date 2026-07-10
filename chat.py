@@ -48,11 +48,13 @@ def strip_thinking_tags(text: str) -> tuple[str, str]:
         Tuple of (cleaned_text, thinking_content). thinking_content is empty
         string if no thinking tags found.
     """
-    # Extract thinking content
+    # Extract thinking content from closed tags
     thinking_parts = re.findall(r'<think>(.*?)</think>', text, flags=re.DOTALL | re.IGNORECASE)
     thinking_parts += re.findall(r'<thinking>(.*?)</thinking>', text, flags=re.DOTALL | re.IGNORECASE)
-    # Catch trailing incomplete thinking fragments
-    thinking_parts += re.findall(r'<think>(.*?)$', text, flags=re.DOTALL | re.IGNORECASE)
+    # Catch trailing unclosed <think> blocks — negative lookahead ensures we skip
+    # blocks that already have a closing tag (avoiding double-extraction)
+    trailing = re.findall(r'<think>(?!.*</think>)(.*?)$', text, flags=re.DOTALL | re.IGNORECASE)
+    thinking_parts += trailing
 
     thinking = "\n".join(p.strip() for p in thinking_parts if p.strip())
 
@@ -343,6 +345,8 @@ def _build_system_prompt(
 def _execute_tool_call(tool_call) -> tuple[str, str]:
     """Execute an LLM tool call and return (tool_name, result_text).
 
+    Handles searxng_search and web_scrape tool calls.
+
     Args:
         tool_call: The tool call object from the LLM response.
 
@@ -352,7 +356,12 @@ def _execute_tool_call(tool_call) -> tuple[str, str]:
     name = tool_call.function.name
     args = json.loads(tool_call.function.arguments)
 
-    if name == "web_scrape":
+    if name == "searxng_search":
+        query = args.get("query", "").strip()
+        if not query:
+            return ("searxng_search", "Error: query parameter is required and cannot be empty.")
+        return ("searxng_search", _web_search(query))
+    elif name == "web_scrape":
         url = args.get("url", "").strip()
         if not url:
             return ("web_scrape", "Error: url parameter is required and cannot be empty.")
@@ -544,13 +553,14 @@ def _run_tool_loop(
 
         # Text response — done
         raw_answer = message.content or ""
-        answer, _ = strip_thinking_tags(raw_answer)
+        answer, thinking = strip_thinking_tags(raw_answer)
         answer = _strip_tool_call_xml(answer)
         return {
             "messages": messages,
             "tool_calls": tool_calls_list,
             "trimmed_history": trimmed_history,
             "answer": answer,
+            "thinking": thinking,
             "needs_final_call": False,
         }
 

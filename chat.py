@@ -361,7 +361,7 @@ def _execute_tool_call(tool_call) -> tuple[str, str]:
         return (name, f"Unknown tool: {name}")
 
 
-def ask_followup(
+def _run_tool_loop(
     question: str,
     ticker: str,
     history: list[dict],
@@ -370,7 +370,11 @@ def ask_followup(
     articles: Optional[list[dict]] = None,
     summary: Optional[str] = None,
 ) -> dict:
-    """Process a follow-up question with multi-turn chat and MCP tool calling.
+    """Run the tool-calling loop synchronously.
+
+    Executes LLM calls with tool calling until the model either:
+    - Returns a text answer (no tool calls), or
+    - Exceeds MAX_SEARCH_ITERATIONS
 
     Args:
         question: User's question.
@@ -382,16 +386,14 @@ def ask_followup(
         summary: Optional initial summary for context.
 
     Returns:
-        Dict with 'answer' (LLM response text), 'history' (updated message list),
-        and 'tool_calls' (list of {tool, query, result} dicts for UI display).
+        Dict with:
+        - 'messages': Full message list (for a follow-up streaming call if needed)
+        - 'tool_calls': List of {tool, query/url, result} dicts for UI display
+        - 'trimmed_history': Trimmed conversation history
+        - 'answer': The text answer if the LLM returned one, or None
+        - 'needs_final_call': True if the loop exhausted without a text answer
     """
-    if not question.strip():
-        return {"answer": "", "history": history, "tool_calls": []}
-
-    # Track tool calls for this invocation
     tool_calls_list = []
-
-    # Track search count to enforce MAX_SEARCHES limit
     search_count = 0
 
     client = OpenAI(base_url=llm_url, api_key="not-needed", timeout=120.0)
@@ -401,12 +403,10 @@ def ask_followup(
         {"role": "system", "content": system_prompt},
     ]
 
-    # Trim history to last MAX_CHAT_TURNS turns if needed
     trimmed_history = history[-(MAX_CHAT_TURNS * 2):] if len(history) > MAX_CHAT_TURNS * 2 else history
     messages.extend(trimmed_history)
     messages.append({"role": "user", "content": question})
 
-    # Tool-calling loop (max MAX_SEARCH_ITERATIONS iterations)
     for iteration in range(MAX_SEARCH_ITERATIONS):
         try:
             response = client.chat.completions.create(
@@ -418,7 +418,6 @@ def ask_followup(
             )
         except Exception as e:
             logger.exception("LLM call failed, falling back to text-only")
-            # Retry without tools
             try:
                 response = client.chat.completions.create(
                     model=model,
@@ -427,20 +426,19 @@ def ask_followup(
                     max_tokens=4096,
                 )
             except Exception as e2:
-                error_answer = f"LLM error: {e2}"
-                new_history = trimmed_history + [
-                    {"role": "user", "content": question},
-                    {"role": "assistant", "content": error_answer},
-                ]
-                return {"answer": error_answer, "history": new_history, "tool_calls": tool_calls_list}
+                return {
+                    "messages": messages,
+                    "tool_calls": tool_calls_list,
+                    "trimmed_history": trimmed_history,
+                    "answer": f"LLM error: {e2}",
+                    "needs_final_call": False,
+                }
 
         message = response.choices[0].message
 
         if message.tool_calls:
-            # Collect tool call metadata for UI display
             tool_call_info = []
 
-            # Append assistant's tool call message FIRST (API expects: assistant -> tool results)
             assistant_msg = {
                 "role": "assistant",
                 "tool_calls": [
@@ -541,28 +539,22 @@ def ask_followup(
                     "content": result,
                 })
 
-            # Store tool call info for this iteration
             tool_calls_list.extend(tool_call_info)
+            continue
 
-            # (No additional limiting — MAX_SEARCHES + MAX_PARALLEL_SEARCHES + system prompt is sufficient)
-            continue  # Loop back to call LLM again with tool results
-
-        # Text response - done
+        # Text response — done
         raw_answer = message.content or ""
         answer, _ = strip_thinking_tags(raw_answer)
         answer = _strip_tool_call_xml(answer)
-        new_history = trimmed_history + [
-            {"role": "user", "content": question},
-            {"role": "assistant", "content": answer},
-        ]
         return {
-            "answer": answer,
-            "history": new_history,
+            "messages": messages,
             "tool_calls": tool_calls_list,
+            "trimmed_history": trimmed_history,
+            "answer": answer,
+            "needs_final_call": False,
         }
 
-    # Exceeded max iterations - call LLM one final time with accumulated context (no tools)
-    # Add a final instruction to force a text response
+    # Exceeded max iterations — need a final call to get the answer
     messages.append({
         "role": "system",
         "content": (
@@ -570,28 +562,95 @@ def ask_followup(
             "Do not make any more tool calls — just write your answer."
         ),
     })
+    return {
+        "messages": messages,
+        "tool_calls": tool_calls_list,
+        "trimmed_history": trimmed_history,
+        "answer": None,
+        "needs_final_call": True,
+    }
+
+
+def stream_final_answer(messages: list[dict], llm_url: str, model: str):
+    """Generator that yields text chunks from a streaming LLM call.
+
+    Used after _run_tool_loop when the loop exhausted its iterations and
+    needs a final answer from the LLM.
+
+    Args:
+        messages: Full message history (including system prompt + tool results).
+        llm_url: OpenAI-compatible LLM base URL.
+        model: Model name.
+
+    Yields:
+        Text chunks (strings) as they arrive from the LLM.
+    """
+    client = OpenAI(base_url=llm_url, api_key="not-needed", timeout=120.0)
     try:
-        final_response = client.chat.completions.create(
+        stream = client.chat.completions.create(
             model=model,
             messages=messages,
             temperature=0.1,
             max_tokens=4096,
+            stream=True,
         )
-        raw_answer = final_response.choices[0].message.content or "Search limit reached."
+        for chunk in stream:
+            delta = chunk.choices[0].delta
+            if delta.content:
+                yield delta.content
+    except Exception as e:
+        logger.exception("Streaming LLM call failed")
+        yield f"LLM error: {e}"
+
+
+def ask_followup(
+    question: str,
+    ticker: str,
+    history: list[dict],
+    llm_url: str,
+    model: str,
+    articles: Optional[list[dict]] = None,
+    summary: Optional[str] = None,
+) -> dict:
+    """Process a follow-up question with multi-turn chat and MCP tool calling.
+
+    Backward-compatible synchronous wrapper around _run_tool_loop + stream_final_answer.
+
+    Args:
+        question: User's question.
+        ticker: Stock ticker symbol.
+        history: Prior chat messages [{role, content}, ...].
+        llm_url: OpenAI-compatible LLM base URL.
+        model: Model name.
+        articles: Optional scraped articles for context.
+        summary: Optional initial summary for context.
+
+    Returns:
+        Dict with 'answer' (LLM response text), 'history' (updated message list),
+        and 'tool_calls' (list of {tool, query, result} dicts for UI display).
+    """
+    if not question.strip():
+        return {"answer": "", "history": history, "tool_calls": []}
+
+    result = _run_tool_loop(question, ticker, history, llm_url, model, articles, summary)
+
+    if result["needs_final_call"]:
+        # Collect streaming chunks into a single string
+        chunks = list(stream_final_answer(result["messages"], llm_url, model))
+        raw_answer = "".join(chunks)
         answer, _ = strip_thinking_tags(raw_answer)
         answer = _strip_tool_call_xml(answer)
-    except Exception:
-        answer = "Search limit reached. I'll provide my best answer with the information I have."
+        if not answer:
+            answer = "Search limit reached. I'll provide my best answer with the information I have."
+    else:
+        answer = result["answer"]
 
-    new_history = trimmed_history + [
+    trimmed = result["trimmed_history"]
+    new_history = trimmed + [
         {"role": "user", "content": question},
         {"role": "assistant", "content": answer},
     ]
-    return {
-        "answer": answer,
-        "history": new_history,
-        "tool_calls": tool_calls_list,
-    }
+    return {"answer": answer, "history": new_history, "tool_calls": result["tool_calls"]}
 
 
 def warm_mcp():

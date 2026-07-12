@@ -8,6 +8,7 @@ from pathlib import Path
 import streamlit as st
 from scraper import scrape_news
 from summarizer import summarize_news
+from chat import StreamingThinkingParser, strip_thinking_tags, _strip_tool_call_xml
 
 PRESETS_FILE = Path(__file__).parent / "presets.json"
 
@@ -546,13 +547,11 @@ if ticker:
                 llm_url=pending["llm_url"], model=pending["model"], articles=pending["articles"], summary=pending["summary"]
             ):
                 if event["type"] == "content_chunk":
-                    raw_text = event["full_content"]
                     current_thinking = event.get("current_thinking", "")
                     # Accumulate thinking: previous iterations + current iteration
                     combined_thinking = total_thinking + ("\n" + current_thinking if total_thinking and current_thinking else "")
                     combined_thinking = combined_thinking or total_thinking or current_thinking
-                    cleaned, _ = strip_thinking_tags(raw_text)
-                    cleaned = _strip_tool_call_xml(cleaned)
+                    cleaned = event.get("cleaned_content", "")
                     if combined_thinking:
                         thinking_placeholder.markdown(escape_dollar_signs(combined_thinking) + "▌")
                     if cleaned:
@@ -594,11 +593,11 @@ if ticker:
         if research["needs_final_call"]:
             status.update(label="✍️ Writing answer...", state="running")
             raw_chunks = []
+            parser = StreamingThinkingParser()
             try:
                 for chunk in stream_final_answer(research["messages"], pending["llm_url"], pending["model"]):
                     raw_chunks.append(chunk)
-                    raw_text = "".join(raw_chunks)
-                    cleaned, thinking = strip_thinking_tags(raw_text)
+                    cleaned, thinking = parser.feed(chunk)
                     cleaned = _strip_tool_call_xml(cleaned)
                     if thinking:
                         thinking_placeholder.markdown(escape_dollar_signs(thinking) + "▌")
@@ -611,7 +610,7 @@ if ticker:
                 st.rerun()
 
             raw_answer = "".join(raw_chunks)
-            full_answer, final_thinking = strip_thinking_tags(raw_answer)
+            full_answer, final_thinking = parser.finalize()
             full_answer = _strip_tool_call_xml(full_answer)
             if not full_answer:
                 full_answer = "Search limit reached. I'll provide my best answer with the information I have."

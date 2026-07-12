@@ -28,6 +28,10 @@ MAX_SEARCHES = 5  # Hard cap on searxng_search calls per question
 MAX_PARALLEL_SEARCHES = 2  # Max searxng_search calls the LLM can make in a single turn
 MAX_SCRAPE_CONTENT_LENGTH = 10000  # Truncate scraped page content to limit context size
 
+TEMPERATURE = 1.0
+TOP_P = 0.95
+PRESENCE_PENALTY = 0.5
+MAX_TOKENS = 10000  # Max tokens for LLM responses (increased for research-heavy tasks)
 
 def _strip_tool_call_xml(text: str) -> str:
     """Strip raw tool call XML (`<tool_call>...</tool_call>`) from LLM content.
@@ -83,6 +87,122 @@ def strip_thinking_tags(text: str) -> tuple[str, str]:
 
     return cleaned.strip(), thinking
 
+
+class StreamingThinkingParser:
+    """Incrementally separates thinking tags from content during streaming.
+
+    Tracks state (inside/outside thinking tags) and accumulates
+    thinking vs. visible content separately — no regex needed per chunk.
+    Handles <think>...</think>, <thinking>...</thinking>, and partial tags
+    across chunk boundaries.
+    """
+
+    def __init__(self):
+        self.thinking_parts: list[str] = []
+        self.content_parts: list[str] = []
+        self._in_thinking = False
+        self._buffer = ""
+        self._current_tag_name = ""
+
+    def feed(self, chunk: str) -> tuple[str, str]:
+        """Feed a new chunk and return (visible_content, thinking_so_far).
+
+        Handles partial tags across chunk boundaries using a small buffer.
+        """
+        self._buffer += chunk
+
+        while self._buffer:
+            if self._in_thinking:
+                end_idx = self._find_close_tag(self._buffer)
+                if end_idx is not None:
+                    tag_end = end_idx
+                    self.thinking_parts.append(self._buffer[:tag_end])
+                    self._buffer = self._buffer[tag_end:]
+                    self._in_thinking = False
+                elif self._might_have_partial_close(self._buffer):
+                    break
+                else:
+                    self.thinking_parts.append(self._buffer)
+                    self._buffer = ""
+            else:
+                open_idx = self._find_open_tag(self._buffer)
+                if open_idx is not None:
+                    tag_name, tag_start, tag_end = open_idx
+                    self.content_parts.append(self._buffer[:tag_start])
+                    self._buffer = self._buffer[tag_end:]
+                    self._in_thinking = True
+                    self._current_tag_name = tag_name
+                elif self._might_have_partial_open(self._buffer):
+                    safe_end = self._safe_flush_point(self._buffer)
+                    if safe_end > 0:
+                        self.content_parts.append(self._buffer[:safe_end])
+                        self._buffer = self._buffer[safe_end:]
+                    break
+                else:
+                    self.content_parts.append(self._buffer)
+                    self._buffer = ""
+
+        return "".join(self.content_parts), "".join(self.thinking_parts)
+
+    def finalize(self) -> tuple[str, str]:
+        """Flush remaining buffer (treat unclosed thinking as thinking content)."""
+        if self._buffer:
+            if self._in_thinking:
+                self.thinking_parts.append(self._buffer)
+            else:
+                self.content_parts.append(self._buffer)
+            self._buffer = ""
+        return "".join(self.content_parts), "".join(self.thinking_parts)
+
+    def _find_open_tag(self, text: str):
+        """Find the first opening thinking tag. Returns (tag_name, start, end) or None."""
+        tags = [("think", "<think>", "</think>"), ("thinking", "<thinking>", "</thinking>")]
+        earliest = None
+        for name, open_t, close_t in tags:
+            idx = text.find(open_t)
+            if idx != -1 and (earliest is None or idx < earliest[1]):
+                earliest = (name, idx, idx + len(open_t))
+        return earliest
+
+    def _find_close_tag(self, text: str) -> int | None:
+        """Find the first closing thinking tag. Returns end index or None."""
+        if self._current_tag_name == "think":
+            idx = text.find("</think>")
+            if idx != -1:
+                return idx + len("</think>")
+        elif self._current_tag_name == "thinking":
+            idx = text.find("</thinking>")
+            if idx != -1:
+                return idx + len("</thinking>")
+        else:
+            # Fallback: check both
+            for close_t in ["</think>", "</thinking>"]:
+                idx = text.find(close_t)
+                if idx != -1:
+                    return idx + len(close_t)
+        return None
+
+    def _might_have_partial_close(self, text: str) -> bool:
+        """Check if buffer might contain a partial closing tag."""
+        if self._current_tag_name == "think":
+            return text.endswith("</think>") or len(text) < len("</think>") and "</think>".startswith(text)
+        elif self._current_tag_name == "thinking":
+            return text.endswith("</thinking>") or len(text) < len("</thinking>") and "</thinking>".startswith(text)
+        return text.endswith("</think>") or text.endswith("</thinking>")
+
+    def _might_have_partial_open(self, text: str) -> bool:
+        """Check if buffer might contain a partial opening tag."""
+        for open_t in ["<think>", "<thinking>"]:
+            if text.endswith(open_t) or (len(text) < len(open_t) and open_t.startswith(text)):
+                return True
+        return False
+
+    def _safe_flush_point(self, text: str) -> int:
+        """Find a safe point to flush content before a potential partial tag."""
+        for open_t in ["<think>", "<thinking>"]:
+            if open_t.startswith(text):
+                return 0
+        return len(text)
 
 
 # LLM tool definitions - names match the MCP server's tool names
@@ -417,7 +537,14 @@ def _run_tool_loop(
                 model=model,
                 messages=messages,
                 tools=TOOLS,
-                temperature=0.6,
+                temperature=TEMPERATURE,
+                top_p=TOP_P,
+                presence_penalty=PRESENCE_PENALTY,
+                max_tokens=MAX_TOKENS,
+                extra_body={
+                    "top_k": 20,
+                    "min_p": 0.00,
+                },
             )
         except Exception as e:
             logger.exception("LLM call failed, falling back to text-only")
@@ -425,7 +552,14 @@ def _run_tool_loop(
                 response = client.chat.completions.create(
                     model=model,
                     messages=messages,
-                    temperature=0.6,
+                    temperature=TEMPERATURE,
+                    top_p=TOP_P,
+                    presence_penalty=PRESENCE_PENALTY,
+                    max_tokens=MAX_TOKENS,
+                    extra_body={
+                        "top_k": 20,
+                        "min_p": 0.00,
+                    },
                 )
             except Exception as e2:
                 return {
@@ -608,7 +742,8 @@ def run_tool_loop_stream(
 
     Yields:
         Dict events with types:
-        - {"type": "content_chunk", "chunk": delta_content, "full_content": accumulated}
+        - {"type": "content_chunk", "chunk": delta_content, "full_content": accumulated,
+           "cleaned_content": cleaned_accumulated, "current_thinking": thinking_so_far}
         - {"type": "tool_start", "tool": tool_name, "args": parsed_args_dict}
         - {"type": "tool_result", "tool": tool_name, "result": result_text}
         - {"type": "done", "messages": ..., "tool_calls": ..., "trimmed_history": ...,
@@ -637,7 +772,14 @@ def run_tool_loop_stream(
                 model=model,
                 messages=messages,
                 tools=TOOLS,
-                temperature=0.6,
+                temperature=TEMPERATURE,
+                top_p=TOP_P,
+                presence_penalty=PRESENCE_PENALTY,
+                max_tokens=MAX_TOKENS,
+                extra_body={
+                    "top_k": 20,
+                    "min_p": 0.00,
+                },
                 stream=True,
             )
         except Exception as e:
@@ -648,23 +790,26 @@ def run_tool_loop_stream(
         current_content = ""
         current_tool_calls = []
 
+        # Per-iteration streaming parser for efficient thinking/content separation
+        parser = StreamingThinkingParser()
+
         # Consume the streaming response
         is_thinking = False
         for chunk in stream:
             delta = chunk.choices[0].delta
-            
+
             # Support vLLM/OpenRouter reasoning_content natively
             r_content = getattr(delta, "reasoning_content", None)
             if not r_content and hasattr(delta, "model_extra") and delta.model_extra:
                 r_content = delta.model_extra.get("reasoning_content")
-                
+
             content_to_add = ""
             if r_content:
                 if not is_thinking:
                     content_to_add += "<think>\n"
                     is_thinking = True
                 content_to_add += r_content
-                
+
             if delta.content:
                 if is_thinking:
                     content_to_add += "\n</think>\n"
@@ -673,11 +818,12 @@ def run_tool_loop_stream(
 
             if content_to_add:
                 current_content += content_to_add
-                _, current_thinking = strip_thinking_tags(current_content)
+                cleaned_content, current_thinking = parser.feed(content_to_add)
                 yield {
                     "type": "content_chunk",
                     "chunk": content_to_add,
                     "full_content": current_content,
+                    "cleaned_content": cleaned_content,
                     "current_thinking": current_thinking,
                 }
                 
@@ -700,10 +846,12 @@ def run_tool_loop_stream(
         if is_thinking:
             current_content += "\n</think>\n"
 
+        # Finalize the parser for this iteration
+        cleaned_content, iteration_thinking = parser.finalize()
+
         # If tool calls detected, execute them and loop back
         if current_tool_calls:
             # Accumulate thinking from this iteration before resetting current_content
-            cleaned_content, iteration_thinking = strip_thinking_tags(current_content)
             if iteration_thinking:
                 if total_thinking:
                     total_thinking += "\n" + iteration_thinking
@@ -813,11 +961,11 @@ def run_tool_loop_stream(
             continue
 
         # Text response — done
-        cleaned, thinking = strip_thinking_tags(current_content)
-        cleaned = _strip_tool_call_xml(cleaned)
+        # Use parser's finalized output (already computed above)
+        cleaned = _strip_tool_call_xml(cleaned_content)
         # Combine thinking from all iterations
-        full_thinking = total_thinking + ("\n" + thinking if total_thinking and thinking else "")
-        full_thinking = full_thinking or thinking
+        full_thinking = total_thinking + ("\n" + iteration_thinking if total_thinking and iteration_thinking else "")
+        full_thinking = full_thinking or iteration_thinking
         yield {
             "type": "done",
             "messages": messages,
@@ -869,7 +1017,13 @@ def stream_final_answer(messages: list[dict], llm_url: str, model: str):
         stream = client.chat.completions.create(
             model=model,
             messages=messages,
-            temperature=0.6,
+            temperature=TEMPERATURE,
+            top_p=TOP_P,
+            presence_penalty=PRESENCE_PENALTY,
+            extra_body={
+                "top_k": 20,
+                "min_p": 0.00,
+            },
             stream=True,
         )
         is_thinking = False

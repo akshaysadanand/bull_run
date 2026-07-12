@@ -249,6 +249,8 @@ def test_ask_followup_handles_max_iterations():
     # Streaming response for the final answer call (stream=True)
     mock_stream_chunk = MagicMock()
     mock_stream_chunk.choices[0].delta.content = "Final answer based on research."
+    mock_stream_chunk.choices[0].delta.reasoning_content = None
+    mock_stream_chunk.choices[0].delta.model_extra = None
     mock_stream = iter([mock_stream_chunk])
 
     def create_side_effect(**kwargs):
@@ -411,10 +413,16 @@ def test_stream_final_answer_yields_chunks():
     # Mock a streaming response
     chunk1 = MagicMock()
     chunk1.choices[0].delta.content = "Hello "
+    chunk1.choices[0].delta.reasoning_content = None
+    chunk1.choices[0].delta.model_extra = None
     chunk2 = MagicMock()
     chunk2.choices[0].delta.content = "world!"
+    chunk2.choices[0].delta.reasoning_content = None
+    chunk2.choices[0].delta.model_extra = None
     chunk3 = MagicMock()
     chunk3.choices[0].delta.content = None  # Empty delta at end
+    chunk3.choices[0].delta.reasoning_content = None
+    chunk3.choices[0].delta.model_extra = None
 
     mock_client = MagicMock()
     mock_client.chat.completions.create.return_value = iter([chunk1, chunk2, chunk3])

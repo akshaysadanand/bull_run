@@ -98,7 +98,7 @@ if "mcp_warmed" not in st.session_state:
     warm_mcp()
     st.session_state.mcp_warmed = True
 
-st.title("🐂 Bull Run — Stock News Aggregator")
+st.title("🐂 Bull Run — Stock Research Assistant")
 
 # --- Preset Selector Row ---
 _presets = load_presets()
